@@ -10,8 +10,8 @@ import (
 
 
 type triggerDialect interface {
-	RenderTrigger(def *trigger.Definition) (string, error)
-	DropTrigger(def *trigger.Definition) (string, error)
+	renderTrigger(def *trigger.Definition) (string, error)
+	dropTrigger(def *trigger.Definition) (string, error)
 }
 
 type dialect interface {
@@ -48,7 +48,7 @@ func triggerNames(def *trigger.Definition) (fnName, trgName string) {
 		fmt.Sprintf("trg_%s_%s_%s", def.Table, timing, event)
 }
 
-func (postgresDialect) RenderTrigger(def *trigger.Definition) (string, error) {
+func (postgresDialect) renderTrigger(def *trigger.Definition) (string, error) {
 	fnName, trgName := triggerNames(def)
 
 	columns := make([]string, 0, len(def.Sets))
@@ -79,7 +79,7 @@ FOR EACH ROW EXECUTE FUNCTION %s();`,
 	), nil
 }
 
-func (postgresDialect) DropTrigger(def *trigger.Definition) (string, error) {
+func (postgresDialect) dropTrigger(def *trigger.Definition) (string, error) {
 	fnName, trgName := triggerNames(def)
 
 	return fmt.Sprintf(`DROP TRIGGER IF EXISTS %s ON %s;

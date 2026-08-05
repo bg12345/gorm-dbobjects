@@ -37,7 +37,7 @@ func Register(objects ...DBObject) error {
 			if !ok {
 				return fmt.Errorf("dbobjects: dialect %q does not support triggers", d.Name())
 			}
-			sql, err := td.RenderTrigger(def)
+			sql, err := td.renderTrigger(def)
 			if err != nil {
 				return err
 			}
