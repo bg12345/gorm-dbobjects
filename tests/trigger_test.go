@@ -71,6 +71,38 @@ func TestTrigger_Build_NoColumnsSet(t *testing.T) {
 	}
 }
 
+func TestTrigger_Kind(t *testing.T) {
+	tr := trigger.BeforeUpdate(&testutil.UserMaster{}).Set("updated_at", trigger.Now())
+	if got := tr.Kind(); got != "trigger" {
+		t.Errorf("Kind() = %q, want %q", got, "trigger")
+	}
+}
+
+func TestTrigger_Name(t *testing.T) {
+	def, err := trigger.BeforeUpdate(&testutil.UserMaster{}).
+		Set("updated_at", trigger.Now()).
+		Name("trg_custom_name").
+		Build()
+	if err != nil {
+		t.Fatalf("Build() error = %v", err)
+	}
+	if def.Name != "trg_custom_name" {
+		t.Errorf("Name = %q, want %q", def.Name, "trg_custom_name")
+	}
+}
+
+func TestTrigger_Name_DefaultsEmpty(t *testing.T) {
+	def, err := trigger.BeforeUpdate(&testutil.UserMaster{}).
+		Set("updated_at", trigger.Now()).
+		Build()
+	if err != nil {
+		t.Fatalf("Build() error = %v", err)
+	}
+	if def.Name != "" {
+		t.Errorf("Name = %q, want empty when Name() was never called", def.Name)
+	}
+}
+
 // --- dbobjects.Register() ---
 
 func TestRegister_WithoutInit(t *testing.T) {
@@ -129,5 +161,48 @@ func TestRegister_AppliesTrigger(t *testing.T) {
 	}
 	if time.Since(reloaded.UpdatedAt) > 10*time.Second {
 		t.Fatalf("UpdatedAt = %v, want a timestamp close to now (trigger should have set NOW())", reloaded.UpdatedAt)
+	}
+}
+
+// TestRegister_AppliesCustomName is an integration test verifying that a
+// trigger built with Name(...) is created in Postgres under that exact
+// name, with its backing function paired as fn_<name without trg_ prefix>
+// (see dialect.go's triggerNames). It skips itself if no DB is reachable.
+func TestRegister_AppliesCustomName(t *testing.T) {
+	db, err := testutil.NewPostgres()
+	if err != nil {
+		t.Skipf("skipping integration test, no Postgres reachable: %v", err)
+	}
+
+	if err := db.AutoMigrate(&testutil.UserMaster{}); err != nil {
+		t.Fatalf("AutoMigrate: %v", err)
+	}
+
+	dbobjects.Init(db)
+	tr := trigger.BeforeUpdate(&testutil.UserMaster{}).
+		Set("updated_at", trigger.Now()).
+		Name("trg_users_touch")
+	if err := dbobjects.Register(tr); err != nil {
+		t.Fatalf("Register: %v", err)
+	}
+	t.Cleanup(func() {
+		db.Exec("DROP TRIGGER IF EXISTS trg_users_touch ON user_master")
+		db.Exec("DROP FUNCTION IF EXISTS fn_users_touch()")
+	})
+
+	var trgCount int64
+	if err := db.Raw(`SELECT count(*) FROM pg_trigger WHERE tgname = ?`, "trg_users_touch").Scan(&trgCount).Error; err != nil {
+		t.Fatalf("querying pg_trigger: %v", err)
+	}
+	if trgCount != 1 {
+		t.Errorf("pg_trigger rows named trg_users_touch = %d, want 1", trgCount)
+	}
+
+	var fnCount int64
+	if err := db.Raw(`SELECT count(*) FROM pg_proc WHERE proname = ?`, "fn_users_touch").Scan(&fnCount).Error; err != nil {
+		t.Fatalf("querying pg_proc: %v", err)
+	}
+	if fnCount != 1 {
+		t.Errorf("pg_proc rows named fn_users_touch = %d, want 1", fnCount)
 	}
 }

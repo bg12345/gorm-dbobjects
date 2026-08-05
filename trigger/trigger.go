@@ -35,10 +35,13 @@ type Definition struct {
 	Timing string // "BEFORE" or "AFTER"
 	Event  string // "INSERT" or "UPDATE"
 	Sets   map[string]Expr
+	Name   string // optional; if empty, dbobjects will generate one
 }
 
 type Trigger interface {
+	Kind() string
 	Set(column string, value Expr) Trigger
+	Name(n string) Trigger
 	Build() (*Definition, error)
 }
 
@@ -48,6 +51,7 @@ type triggerBuilder struct {
 	event  string
 	sets   map[string]Expr
 	err    error
+	name   string
 }
 
 func newTrigger(model any, timing, event string) Trigger {
@@ -93,5 +97,16 @@ func (t *triggerBuilder) Build() (*Definition, error) {
 		Timing: t.timing,
 		Event:  t.event,
 		Sets:   t.sets,
+		Name:   t.name,
 	}, nil
+}
+
+
+func (t *triggerBuilder) Kind() string {
+	return "trigger"
+}
+
+func (t *triggerBuilder) Name(n string) Trigger {
+	t.name = n
+	return t
 }

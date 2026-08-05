@@ -8,18 +8,16 @@ import (
 	"github.com/bg12345/gorm-dbobjects/trigger"
 )
 
-// dialect renders a trigger.Definition into the DDL for one database
-// engine. Register picks a dialect from the connected DB's driver name
-// (gorm.DB.Name()), so adding a new engine never touches the trigger
-// package's public API or Register's signature.
-type dialect interface {
-	render(def *trigger.Definition) string
+
+type triggerDialect interface {
+	RenderTrigger(def *trigger.Definition) (string, error)
+	DropTrigger(def *trigger.Definition) (string, error)
 }
 
-// dialects is keyed by gorm.DB.Name() (e.g. "postgres", "mysql").
-// Only postgres is implemented today; unknown names are rejected by
-// Register with an explicit error rather than silently emitting the
-// wrong SQL.
+type dialect interface {
+	Name() string
+}
+
 var dialects = map[string]dialect{
 	"postgres": postgresDialect{},
 }
@@ -31,11 +29,27 @@ func dialectFor(name string) (dialect, bool) {
 
 type postgresDialect struct{}
 
-func (postgresDialect) render(def *trigger.Definition) string {
+func (postgresDialect) Name() string {
+	return "postgres"
+}
+
+// triggerNames derives the trigger and backing-function names for def. If
+// def.Name is set, it is used verbatim as the trigger name and the function
+// name is paired to it ("fn_" + Name with any "trg_" prefix stripped), so a
+// caller-supplied Name("trg_users_touch") yields function fn_users_touch.
+// Otherwise both names are generated from table/timing/event.
+func triggerNames(def *trigger.Definition) (fnName, trgName string) {
+	if def.Name != "" {
+		return "fn_" + strings.TrimPrefix(def.Name, "trg_"), def.Name
+	}
 	timing := strings.ToLower(def.Timing)
 	event := strings.ToLower(def.Event)
-	fnName := fmt.Sprintf("fn_%s_%s_%s", def.Table, timing, event)
-	trgName := fmt.Sprintf("trg_%s_%s_%s", def.Table, timing, event)
+	return fmt.Sprintf("fn_%s_%s_%s", def.Table, timing, event),
+		fmt.Sprintf("trg_%s_%s_%s", def.Table, timing, event)
+}
+
+func (postgresDialect) RenderTrigger(def *trigger.Definition) (string, error) {
+	fnName, trgName := triggerNames(def)
 
 	columns := make([]string, 0, len(def.Sets))
 	for column := range def.Sets {
@@ -62,5 +76,17 @@ FOR EACH ROW EXECUTE FUNCTION %s();`,
 		trgName, def.Table,
 		trgName, def.Timing, def.Event, def.Table,
 		fnName,
-	)
+	), nil
 }
+
+func (postgresDialect) DropTrigger(def *trigger.Definition) (string, error) {
+	fnName, trgName := triggerNames(def)
+
+	return fmt.Sprintf(`DROP TRIGGER IF EXISTS %s ON %s;
+DROP FUNCTION IF EXISTS %s();`,
+		trgName, def.Table,
+		fnName,
+	), nil
+}
+
+var _ triggerDialect = postgresDialect{}
