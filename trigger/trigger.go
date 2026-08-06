@@ -3,7 +3,6 @@ package trigger
 import (
 	"fmt"
 	"sync"
-
 	"gorm.io/gorm/schema"
 )
 

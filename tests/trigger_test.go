@@ -4,6 +4,7 @@ import (
 	"fmt"
 	"testing"
 	"time"
+	"context"
 
 	dbobjects "github.com/bg12345/gorm-dbobjects"
 	"github.com/bg12345/gorm-dbobjects/internal/testutil"
@@ -111,7 +112,7 @@ func TestRegister_WithoutInit(t *testing.T) {
 	dbobjects.Init(nil)
 
 	tr := trigger.BeforeUpdate(&testutil.UserMaster{}).Set("updated_at", trigger.Now())
-	if err := dbobjects.Register(tr); err == nil {
+	if err := dbobjects.Register(context.Background(), tr); err == nil {
 		t.Fatal("Register() error = nil, want error when Init was never called")
 	}
 }
@@ -133,7 +134,7 @@ func TestRegister_AppliesTrigger(t *testing.T) {
 
 	dbobjects.Init(db)
 	tr := trigger.BeforeUpdate(&testutil.UserMaster{}).Set("updated_at", trigger.Now())
-	if err := dbobjects.Register(tr); err != nil {
+	if err := dbobjects.Register(context.Background(), tr); err != nil {
 		t.Fatalf("Register: %v", err)
 	}
 
@@ -182,7 +183,7 @@ func TestRegister_AppliesCustomName(t *testing.T) {
 	tr := trigger.BeforeUpdate(&testutil.UserMaster{}).
 		Set("updated_at", trigger.Now()).
 		Name("trg_users_touch")
-	if err := dbobjects.Register(tr); err != nil {
+	if err := dbobjects.Register(context.Background(), tr); err != nil {
 		t.Fatalf("Register: %v", err)
 	}
 	t.Cleanup(func() {
