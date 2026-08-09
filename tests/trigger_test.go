@@ -26,8 +26,8 @@ func TestTrigger_Build(t *testing.T) {
 	if def.Timing != "BEFORE" || def.Event != "UPDATE" {
 		t.Errorf("Timing/Event = %s/%s, want BEFORE/UPDATE", def.Timing, def.Event)
 	}
-	if got := def.Sets["updated_at"].Raw; got != "NOW()" {
-		t.Errorf("Sets[updated_at].Raw = %q, want NOW()", got)
+	if got := def.Sets["updated_at"].Kind; got != trigger.ExprNow {
+		t.Errorf("Sets[updated_at].Kind = %v, want ExprNow", got)
 	}
 }
 

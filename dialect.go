@@ -33,6 +33,19 @@ func (postgresDialect) Name() string {
 	return "postgres"
 }
 
+// renderExpr resolves e to this dialect's SQL spelling. Postgres and
+// MySQL both happen to spell "current timestamp" as NOW(); other
+// engines will need their own version of this method once those
+// dialects exist.
+func (postgresDialect) renderExpr(e trigger.Expr) string {
+	switch e.Kind {
+	case trigger.ExprNow:
+		return "NOW()"
+	default:
+		return e.Raw
+	}
+}
+
 // triggerNames derives the trigger and backing-function names for def. If
 // def.Name is set, it is used verbatim as the trigger name and the function
 // name is paired to it ("fn_" + Name with any "trg_" prefix stripped), so a
@@ -48,7 +61,7 @@ func triggerNames(def *trigger.Definition) (fnName, trgName string) {
 		fmt.Sprintf("trg_%s_%s_%s", def.Table, timing, event)
 }
 
-func (postgresDialect) renderTrigger(def *trigger.Definition) (string, error) {
+func (d postgresDialect) renderTrigger(def *trigger.Definition) (string, error) {
 	fnName, trgName := triggerNames(def)
 
 	columns := make([]string, 0, len(def.Sets))
@@ -59,7 +72,7 @@ func (postgresDialect) renderTrigger(def *trigger.Definition) (string, error) {
 
 	var body strings.Builder
 	for _, column := range columns {
-		fmt.Fprintf(&body, "  NEW.%s = %s;\n", column, def.Sets[column].Raw)
+		fmt.Fprintf(&body, "  NEW.%s = %s;\n", column, d.renderExpr(def.Sets[column]))
 	}
 
 	return fmt.Sprintf(`CREATE OR REPLACE FUNCTION %s() RETURNS TRIGGER AS $$

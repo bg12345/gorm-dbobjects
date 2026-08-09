@@ -10,21 +10,33 @@ import (
 // model reuse gorm's parsed schema instead of re-parsing every time.
 var schemaCache = &sync.Map{}
 
+// ExprKind distinguishes what an Expr represents, so a dialect can
+// render it in its own engine's spelling (Postgres/MySQL's NOW() vs
+// SQL Server's SYSUTCDATETIME() vs Oracle's SYSDATE, for ExprNow)
+// instead of Expr baking in one dialect's spelling itself.
+type ExprKind int
+
+const (
+	ExprRaw ExprKind = iota // zero value: Raw holds the literal SQL to emit verbatim
+	ExprNow                  // "current timestamp" -- each dialect resolves its own spelling
+)
+
 // Expr represents a value assigned to a column inside the trigger body.
 // Raw is written into the generated SQL verbatim, so callers should only
 // build it via Now()/Raw() rather than embedding untrusted input.
 type Expr struct {
-	Raw string
+	Kind ExprKind
+	Raw  string
 }
 
 // Now renders as the Postgres NOW() function.
 func Now() Expr {
-	return Expr{Raw: "NOW()"}
+	return Expr{Kind: ExprNow}
 }
 
 // Raw renders sql verbatim in the trigger body, e.g. Raw("version + 1").
 func Raw(sql string) Expr {
-	return Expr{Raw: sql}
+	return Expr{Kind: ExprRaw, Raw: sql}
 }
 
 // Definition is the DB-agnostic description of a trigger, produced by
