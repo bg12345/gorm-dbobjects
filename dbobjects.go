@@ -1,6 +1,7 @@
 package dbobjects
 
 import (
+	"context"
 	"fmt"
 
 	"github.com/bg12345/gorm-dbobjects/trigger"
@@ -47,48 +48,69 @@ const (
 // has (trigger has Table; a future procedure has no table at all, per
 // docs/PLAN.md §3.3), so nothing forces a field across kinds that don't
 // share one.
-func resolveDDL(d dialect, obj DBObject, op ddlOp) (sql, desc string, err error) {
+func resolveDDL(d dialect, obj DBObject, op ddlOp) (sql, desc, name string, err error) {
 	switch o := obj.(type) {
 	case trigger.Trigger:
 		def, err := o.Build()
 		if err != nil {
-			return "", "", err
+			return "", "", "", err
 		}
 		td, ok := d.(triggerDialect)
 		if !ok {
-			return "", "", fmt.Errorf("dbobjects: dialect %q does not support triggers", d.Name())
+			return "", "", "", fmt.Errorf("dbobjects: dialect %q does not support triggers", d.Name())
 		}
+		_, trgName := triggerNames(def)
 		desc = fmt.Sprintf("trigger on %q", def.Table)
 		if op == opDrop {
 			sql, err = td.dropTrigger(def)
 		} else {
 			sql, err = td.renderTrigger(def)
 		}
-		return sql, desc, err
+		return sql, desc, trgName, err
 	default:
-		return "", "", fmt.Errorf("dbobjects: unsupported object kind %q", obj.Kind())
+		return "", "", "", fmt.Errorf("dbobjects: unsupported object kind %q", obj.Kind())
 	}
 }
 
+type resolved struct {
+	sql  string
+	desc string
+}
 
 // Register builds each object's definition and executes the resulting
 // DDL against the DB configured via Init, using the dialect that matches
 // that DB's driver (see dialect.go).
-func Register(objects ...DBObject) error {
+func Register(ctx context.Context, objects ...DBObject) error {
 	d,err := resolveDialect("Register")
 	if err != nil {
 		return err
 	}
-	for _, obj := range objects {
-		sql, desc, err := resolveDDL(d, obj, opRender)
+	results:=make([]resolved, len(objects))
+	seen:=make(map[string]int, len(objects))
+	for i, obj := range objects {
+		sql, desc, name, err := resolveDDL(d, obj, opRender)
 		if err != nil {
 			return err
 		}
-		if err := db.Exec(sql).Error; err != nil {
-			return fmt.Errorf("dbobjects: applying %s: %w", desc, err)
+		if first,ok:=seen[name]; ok {
+			return fmt.Errorf("dbobjects: objects %d and %d both resolve to name %q", first, i, name)
 		}
+		seen[name] = i
+		results[i] = resolved{sql: sql, desc: desc}
 	}
-	return nil
+	// Transactional on engines with transactional DDL (Postgres, SQL
+	// Server, SQLite) -- a ctx cancellation or a later statement's error
+	// rolls back everything already applied in this call. On engines
+	// that implicitly commit DDL (MySQL, Oracle), this wrapper can't
+	// undo a statement that's already forced its own commit.
+	return db.WithContext(ctx).Transaction(func(tx *gorm.DB) error {
+		for _, r := range results {
+			if err := tx.Exec(r.sql).Error; err != nil {
+				return fmt.Errorf("dbobjects: applying %s: %w", r.desc, err)
+			}
+		}
+		return nil
+	})
 }
 
 
@@ -96,17 +118,17 @@ func Register(objects ...DBObject) error {
 // and later view/procedure) from the DB configured via Init. Safe to
 // call for objects that were never registered -- dialect DropTrigger
 // implementations use DROP ... IF EXISTS.
-func Drop(objects ...DBObject) error {
+func Drop(ctx context.Context, objects ...DBObject) error {
 	d, err := resolveDialect("Drop")
 	if err != nil {
 		return err
 	}
 	for _, obj := range objects {
-		sql, desc, err := resolveDDL(d, obj, opDrop)
+		sql, desc, _, err := resolveDDL(d, obj, opDrop)
 		if err != nil {
 			return err
 		}
-		if err := db.Exec(sql).Error; err != nil {
+		if err := db.WithContext(ctx).Exec(sql).Error; err != nil {
 			return fmt.Errorf("dbobjects: dropping %s: %w", desc, err)
 		}
 	}
@@ -139,7 +161,7 @@ func Render(objects []DBObject, mode RenderMode) ([]string, error) {
 
 	out := make([]string, 0, len(objects))
 	for _, obj := range objects {
-		sql, _, err := resolveDDL(d, obj, opRender)
+		sql, _,_, err := resolveDDL(d, obj, opRender)
 		if err != nil {
 			return nil, err
 		}
