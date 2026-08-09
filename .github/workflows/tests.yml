@@ -25,6 +25,22 @@ jobs:
           --health-timeout=5s
           --health-retries=5
 
+      mysql:
+        image: mysql:8
+        env:
+          # root is a reserved user for this image -- set its password
+          # via MYSQL_ROOT_PASSWORD rather than MYSQL_USER/MYSQL_PASSWORD,
+          # which create a separate, non-root user instead.
+          MYSQL_ROOT_PASSWORD: root
+          MYSQL_DATABASE: dbobjects_test
+        ports:
+          - 3306:3306
+        options: >-
+          --health-cmd="mysqladmin ping -h localhost -uroot -proot"
+          --health-interval=10s
+          --health-timeout=5s
+          --health-retries=10
+
     env:
       POSTGRES_HOST: localhost
       POSTGRES_USER: postgres
@@ -32,6 +48,12 @@ jobs:
       POSTGRES_DB: dbobjects_test
       POSTGRES_PORT: 5432
       POSTGRES_SSLMODE: disable
+
+      MYSQL_HOST: localhost
+      MYSQL_USER: root
+      MYSQL_PASSWORD: root
+      MYSQL_DB: dbobjects_test
+      MYSQL_PORT: 3306
 
     steps:
       - name: Checkout
