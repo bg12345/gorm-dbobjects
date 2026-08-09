@@ -207,3 +207,102 @@ func TestRegister_AppliesCustomName(t *testing.T) {
 		t.Errorf("pg_proc rows named fn_users_touch = %d, want 1", fnCount)
 	}
 }
+
+// TestRegister_MySQL_AppliesTrigger is an integration test: it connects
+// to a real MySQL (via internal/testutil.NewMySQL, configured through
+// .env) and verifies the registered BEFORE UPDATE trigger actually
+// overrides updated_at at the database level, independent of gorm's own
+// hooks -- the MySQL equivalent of TestRegister_AppliesTrigger above.
+// Skips itself if no MySQL is reachable.
+func TestRegister_MySQL_AppliesTrigger(t *testing.T) {
+	db, err := testutil.NewMySQL()
+	if err != nil {
+		t.Skipf("skipping integration test, no MySQL reachable: %v", err)
+	}
+
+	if err := db.AutoMigrate(&testutil.UserMaster{}); err != nil {
+		t.Fatalf("AutoMigrate: %v", err)
+	}
+
+	dbobjects.Init(db)
+	tr := trigger.BeforeUpdate(&testutil.UserMaster{}).Set("updated_at", trigger.Now())
+	if err := dbobjects.Register(context.Background(), tr); err != nil {
+		t.Fatalf("Register: %v", err)
+	}
+
+	user := testutil.UserMaster{Name: "Ada", Email: fmt.Sprintf("ada-mysql-%d@example.com", time.Now().UnixNano())}
+	if err := db.Create(&user).Error; err != nil {
+		t.Fatalf("Create: %v", err)
+	}
+	t.Cleanup(func() { db.Unscoped().Delete(&user) })
+
+	// Force updated_at to an old value via a raw column update. This
+	// bypasses gorm's own timestamp hook, but it's still a real UPDATE
+	// statement, so the DB-level trigger fires on it regardless.
+	old := time.Now().Add(-24 * time.Hour).Truncate(time.Second)
+	if err := db.Model(&user).UpdateColumn("updated_at", old).Error; err != nil {
+		t.Fatalf("UpdateColumn: %v", err)
+	}
+
+	var reloaded testutil.UserMaster
+	if err := db.First(&reloaded, user.ID).Error; err != nil {
+		t.Fatalf("First: %v", err)
+	}
+
+	if reloaded.UpdatedAt.Equal(old) {
+		t.Fatal("UpdatedAt still equals the value we tried to force; trigger did not fire")
+	}
+	if time.Since(reloaded.UpdatedAt) > 10*time.Second {
+		t.Fatalf("UpdatedAt = %v, want a timestamp close to now (trigger should have set NOW())", reloaded.UpdatedAt)
+	}
+}
+
+// TestRegister_MySQL_CompensatesOnFailure is an integration test: it
+// connects to a real MySQL (transactional() == false, docs/PLAN.md §2.5
+// -- the only dialect that exercises Register's compensating-rollback
+// path) and verifies that when a later object in one Register call
+// fails, an earlier object that already succeeded gets compensated
+// (dropped) rather than left behind half-applied. The second trigger is
+// engineered to fail at *execution* time via an intentionally invalid
+// Raw() expression -- Set() only validates that the column exists, not
+// that the expression is valid SQL, so this fails inside MySQL's own
+// CREATE TRIGGER parsing, after the first trigger has already been
+// applied. Skips itself if no MySQL is reachable.
+func TestRegister_MySQL_CompensatesOnFailure(t *testing.T) {
+	db, err := testutil.NewMySQL()
+	if err != nil {
+		t.Skipf("skipping integration test, no MySQL reachable: %v", err)
+	}
+
+	if err := db.AutoMigrate(&testutil.UserMaster{}); err != nil {
+		t.Fatalf("AutoMigrate: %v", err)
+	}
+
+	dbobjects.Init(db)
+
+	good := trigger.BeforeUpdate(&testutil.UserMaster{}).
+		Set("updated_at", trigger.Now()).
+		Name("trg_compensation_good")
+	bad := trigger.BeforeUpdate(&testutil.UserMaster{}).
+		Set("name", trigger.Raw("this is not valid sql !!!")).
+		Name("trg_compensation_bad")
+
+	t.Cleanup(func() {
+		db.Exec("DROP TRIGGER IF EXISTS trg_compensation_good")
+		db.Exec("DROP TRIGGER IF EXISTS trg_compensation_bad")
+	})
+
+	if err := dbobjects.Register(context.Background(), good, bad); err == nil {
+		t.Fatal("Register() error = nil, want error from the intentionally invalid second trigger")
+	}
+
+	var count int64
+	if err := db.Raw(`SELECT count(*) FROM information_schema.triggers WHERE trigger_name = ?`,
+		"trg_compensation_good").Scan(&count).Error; err != nil {
+		t.Fatalf("querying information_schema.triggers: %v", err)
+	}
+	if count != 0 {
+		t.Errorf("trg_compensation_good still exists after Register failed on a later object; "+
+			"compensation did not run. count = %d, want 0", count)
+	}
+}

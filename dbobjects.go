@@ -2,11 +2,23 @@ package dbobjects
 
 import (
 	"context"
+	"errors"
 	"fmt"
+	"slices"
+	"strings"
+	"time"
 
 	"github.com/bg12345/gorm-dbobjects/trigger"
 	"gorm.io/gorm"
 )
+
+// compensationTimeout bounds how long the best-effort rollback pass
+// (compensate) is allowed to run when a non-transactional-DDL engine's
+// Register call fails partway through a batch. It survives the
+// original ctx's cancellation/expiry (that's the whole point -- ctx
+// may be exactly what just caused the failure), but still can't hang
+// forever if the DB connection itself is in a bad state.
+const compensationTimeout = 10 * time.Second
 
 type DBObject interface {
 	Kind() string
@@ -48,33 +60,59 @@ const (
 // has (trigger has Table; a future procedure has no table at all, per
 // docs/PLAN.md §3.3), so nothing forces a field across kinds that don't
 // share one.
-func resolveDDL(d dialect, obj DBObject, op ddlOp) (sql, desc, name string, err error) {
+func resolveDDL(d dialect, obj DBObject, op ddlOp) (stmts []string, desc, name string, err error) {
 	switch o := obj.(type) {
 	case trigger.Trigger:
 		def, err := o.Build()
 		if err != nil {
-			return "", "", "", err
+			return nil, "", "", err
 		}
 		td, ok := d.(triggerDialect)
 		if !ok {
-			return "", "", "", fmt.Errorf("dbobjects: dialect %q does not support triggers", d.Name())
+			return nil, "", "", fmt.Errorf("dbobjects: dialect %q does not support triggers", d.Name())
 		}
 		_, trgName := triggerNames(def)
 		desc = fmt.Sprintf("trigger on %q", def.Table)
 		if op == opDrop {
-			sql, err = td.dropTrigger(def)
+			stmts, err = td.dropTrigger(def)
 		} else {
-			sql, err = td.renderTrigger(def)
+			stmts, err = td.renderTrigger(def)
 		}
-		return sql, desc, trgName, err
+		return stmts, desc, trgName, err
 	default:
-		return "", "", "", fmt.Errorf("dbobjects: unsupported object kind %q", obj.Kind())
+		return nil, "", "", fmt.Errorf("dbobjects: unsupported object kind %q", obj.Kind())
 	}
 }
 
 type resolved struct {
-	sql  string
-	desc string
+	stmts     []string
+	dropStmts []string
+	desc      string
+}
+
+// compensate best-effort drops each of applied's objects, in reverse
+// order, after a Register call failed partway through on a
+// non-transactional-DDL engine (§2.5) -- creation isn't atomic there,
+// so this is the closest approximation available. Uses a context
+// derived from ctx that ignores its cancellation/deadline (ctx may be
+// exactly what just expired) but is bounded by its own short timeout.
+// Never stops early -- one object's compensation failing doesn't
+// predict whether the others will too. Returns one error per object
+// whose compensation itself failed.
+func compensate(ctx context.Context, applied []resolved) []error {
+	cleanupCtx, cancel := context.WithTimeout(context.WithoutCancel(ctx), compensationTimeout)
+	defer cancel()
+
+	var errs []error
+	for _, r := range slices.Backward(applied) {
+		for _, stmt := range r.dropStmts {
+			if err := db.WithContext(cleanupCtx).Exec(stmt).Error; err != nil {
+				errs = append(errs, fmt.Errorf("compensating %s: %w", r.desc, err))
+				break // this object's cleanup failed; move to the next one
+			}
+		}
+	}
+	return errs
 }
 
 // Register builds each object's definition and executes the resulting
@@ -88,7 +126,7 @@ func Register(ctx context.Context, objects ...DBObject) error {
 	results:=make([]resolved, len(objects))
 	seen:=make(map[string]int, len(objects))
 	for i, obj := range objects {
-		sql, desc, name, err := resolveDDL(d, obj, opRender)
+		stmts, desc, name, err := resolveDDL(d, obj, opRender)
 		if err != nil {
 			return err
 		}
@@ -96,21 +134,47 @@ func Register(ctx context.Context, objects ...DBObject) error {
 			return fmt.Errorf("dbobjects: objects %d and %d both resolve to name %q", first, i, name)
 		}
 		seen[name] = i
-		results[i] = resolved{sql: sql, desc: desc}
+
+		dropStmts, _, _, err := resolveDDL(d, obj, opDrop)
+		if err != nil {
+			return err
+		}
+
+		results[i] = resolved{stmts: stmts, dropStmts: dropStmts, desc: desc}
 	}
+
 	// Transactional on engines with transactional DDL (Postgres, SQL
 	// Server, SQLite) -- a ctx cancellation or a later statement's error
 	// rolls back everything already applied in this call. On engines
 	// that implicitly commit DDL (MySQL, Oracle), this wrapper can't
 	// undo a statement that's already forced its own commit.
-	return db.WithContext(ctx).Transaction(func(tx *gorm.DB) error {
-		for _, r := range results {
-			if err := tx.Exec(r.sql).Error; err != nil {
-				return fmt.Errorf("dbobjects: applying %s: %w", r.desc, err)
+	if d.transactional() {
+		return db.WithContext(ctx).Transaction(func(tx *gorm.DB) error {
+			for _, r := range results {
+				for _, stmt := range r.stmts {
+					if err := tx.Exec(stmt).Error; err != nil {
+						return fmt.Errorf("dbobjects: applying %s: %w", r.desc, err)
+					}
+				}
+			}
+			return nil
+		})
+	}
+
+	for i, r := range results {
+		for _, stmt := range r.stmts {
+			if err := db.WithContext(ctx).Exec(stmt).Error; err != nil {
+				applyErr := fmt.Errorf("dbobjects: applying %s: %w", r.desc, err)
+				compErrs := compensate(ctx, results[:i+1])
+				if len(compErrs) == 0 {
+					return applyErr
+				}
+				return fmt.Errorf("%w; additionally, best-effort rollback failed for %d object(s): %w",
+					applyErr, len(compErrs), errors.Join(compErrs...))
 			}
 		}
-		return nil
-	})
+	}
+	return nil
 }
 
 
@@ -124,12 +188,14 @@ func Drop(ctx context.Context, objects ...DBObject) error {
 		return err
 	}
 	for _, obj := range objects {
-		sql, desc, _, err := resolveDDL(d, obj, opDrop)
+		stmts, desc, _, err := resolveDDL(d, obj, opDrop)
 		if err != nil {
 			return err
 		}
-		if err := db.WithContext(ctx).Exec(sql).Error; err != nil {
-			return fmt.Errorf("dbobjects: dropping %s: %w", desc, err)
+		for _, stmt := range stmts {
+			if err := db.WithContext(ctx).Exec(stmt).Error; err != nil {
+				return fmt.Errorf("dbobjects: dropping %s: %w", desc, err)
+			}
 		}
 	}
 	return nil
@@ -161,11 +227,11 @@ func Render(objects []DBObject, mode RenderMode) ([]string, error) {
 
 	out := make([]string, 0, len(objects))
 	for _, obj := range objects {
-		sql, _,_, err := resolveDDL(d, obj, opRender)
+		stmts, _,_, err := resolveDDL(d, obj, opRender)
 		if err != nil {
 			return nil, err
 		}
-		out = append(out, sql)
+		out = append(out, strings.Join(stmts, "\n\n"))
 	}
 	return out, nil
 }
