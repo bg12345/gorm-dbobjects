@@ -34,15 +34,16 @@ as a runtime error against a live database.
 
 ## Status
 
-Triggers are implemented and tested end-to-end (including a real,
-verified rollback path for engines where DDL isn't transactional).
-Views and procedures are designed but not yet built — see the design
-notes below.
+Triggers and views are both implemented and tested end-to-end on
+Postgres and MySQL — including a real, verified rollback path for
+engines where DDL isn't transactional, and a view built from a live
+gorm query callback, not just a raw SQL string. Procedures are designed
+but not yet built — see the design notes below.
 
 | | Postgres | MySQL | SQL Server | SQLite | Oracle |
 |---|:---:|:---:|:---:|:---:|:---:|
 | Triggers | ✅ | ✅ | planned | planned | planned |
-| Views | planned | planned | planned | planned | planned |
+| Views | ✅ | ✅ | planned | planned | planned |
 | Procedures | planned | planned | planned | planned | planned |
 
 ## Install
@@ -62,14 +63,16 @@ import (
 
     dbobjects "github.com/bg12345/gorm-dbobjects"
     "github.com/bg12345/gorm-dbobjects/trigger"
+    "github.com/bg12345/gorm-dbobjects/view"
     "gorm.io/driver/postgres"
     "gorm.io/gorm"
 )
 
 type User struct {
     gorm.Model
-    Name  string
-    Email string
+    Name   string
+    Email  string
+    Active bool
 }
 
 func main() {
@@ -102,6 +105,34 @@ func main() {
 `Register`/`Drop` work the same way regardless of which engine `db` is
 connected to — the dialect that generates the actual DDL is resolved
 from the connection itself.
+
+Views work the same way, built from a gorm query callback instead of a
+raw SQL string — `dbobjects` reuses gorm's own dialect layer to resolve
+it, so the same view definition renders correctly on whichever engine
+it's registered against:
+
+```go
+v := view.New("active_users").
+    Query(func(tx *gorm.DB) *gorm.DB {
+        return tx.Model(&User{}).Where("active = ?", true)
+    })
+
+if err := dbobjects.Register(context.Background(), v); err != nil {
+    log.Fatal(err)
+}
+```
+
+For the one query gorm's builder can't express — Oracle's `ROWNUM`
+instead of `LIMIT`, say — `Raw(sql)` overrides `Query` with a literal
+string when you need the escape hatch:
+
+```go
+v := view.New("recent_signups").
+    Query(func(tx *gorm.DB) *gorm.DB {
+        return tx.Model(&User{}).Order("created_at desc").Limit(100)
+    }).
+    Raw("SELECT * FROM (SELECT * FROM users ORDER BY created_at DESC) WHERE ROWNUM <= 100")
+```
 
 ## How it's built
 

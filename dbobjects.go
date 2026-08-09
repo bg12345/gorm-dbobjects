@@ -9,6 +9,7 @@ import (
 	"time"
 
 	"github.com/bg12345/gorm-dbobjects/trigger"
+	"github.com/bg12345/gorm-dbobjects/view"
 	"gorm.io/gorm"
 )
 
@@ -79,6 +80,22 @@ func resolveDDL(d dialect, obj DBObject, op ddlOp) (stmts []string, desc, name s
 			stmts, err = td.renderTrigger(def)
 		}
 		return stmts, desc, trgName, err
+	case view.View:
+		def, err := o.Build()
+		if err != nil {
+			return nil, "", "", err
+		}
+		vd, ok := d.(viewDialect)
+		if !ok {
+			return nil, "", "", fmt.Errorf("dbobjects: dialect %q does not support views", d.Name())
+		}
+		desc = fmt.Sprintf("view %q", def.Name)
+		if op == opDrop {
+			stmts, err = vd.dropView(def)
+		} else {
+			stmts, err = vd.renderView(db, def)
+		}
+		return stmts, desc, def.Name, err
 	default:
 		return nil, "", "", fmt.Errorf("dbobjects: unsupported object kind %q", obj.Kind())
 	}

@@ -6,12 +6,19 @@ import (
 	"strings"
 
 	"github.com/bg12345/gorm-dbobjects/trigger"
+	"github.com/bg12345/gorm-dbobjects/view"
+	"gorm.io/gorm"
 )
 
 
 type triggerDialect interface {
 	renderTrigger(def *trigger.Definition) ([]string, error)
 	dropTrigger(def *trigger.Definition) ([]string, error)
+}
+
+type viewDialect interface {
+	renderView(db *gorm.DB, def *view.Definition) ([]string, error)
+	dropView(def *view.Definition) ([]string, error)
 }
 
 type dialect interface {
@@ -155,5 +162,56 @@ func (d mysqlDialect) dropTrigger(def *trigger.Definition) ([]string, error) {
 }
 
 
+// renderViewCreateOrReplace renders def as a CREATE OR REPLACE VIEW
+// statement -- shared by postgresDialect and mysqlDialect since both
+// support identical syntax here, unlike triggers where the two engines
+// diverge structurally (SQL Server's CREATE OR ALTER and SQLite's lack
+// of CREATE OR REPLACE will need their own implementations later).
+// Resolves RawSQL verbatim if set; otherwise invokes QueryFn via
+// db.ToSQL to get fully-interpolated literal SQL, since a CREATE VIEW
+// body can't carry bind parameters the way a normal query can.
+func renderViewCreateOrReplace(db *gorm.DB, def *view.Definition) ([]string, error) {
+	body := def.RawSQL
+	if body == "" {
+		// ToSQL only populates stmt.SQL once a finisher method (Find,
+		// First, ...) runs gorm's query callback chain -- .Model()/
+		// .Where() alone just accumulate clauses on the Statement.
+		// view.Query(fn) deliberately doesn't require callers to know
+		// that (no .Find(&dest) in their callback), so it's appended
+		// here instead. The destination is a generic map, not the
+		// caller's model type, since this layer never knows that type
+		// -- it relies on .Model() already being set inside fn to
+		// determine what gets selected.
+		body = db.ToSQL(func(tx *gorm.DB) *gorm.DB {
+			return def.QueryFn(tx).Find(&[]map[string]any{})
+		})
+	}
+	return []string{fmt.Sprintf(`CREATE OR REPLACE VIEW %s AS %s`, def.Name, body)}, nil
+}
+
+// dropViewIfExists renders a DROP VIEW IF EXISTS statement -- shared
+// for the same reason renderViewCreateOrReplace is.
+func dropViewIfExists(def *view.Definition) ([]string, error) {
+	return []string{fmt.Sprintf(`DROP VIEW IF EXISTS %s;`, def.Name)}, nil
+}
+
+func (postgresDialect) renderView(db *gorm.DB, def *view.Definition) ([]string, error) {
+	return renderViewCreateOrReplace(db, def)
+}
+
+func (postgresDialect) dropView(def *view.Definition) ([]string, error) {
+	return dropViewIfExists(def)
+}
+
+func (mysqlDialect) renderView(db *gorm.DB, def *view.Definition) ([]string, error) {
+	return renderViewCreateOrReplace(db, def)
+}
+
+func (mysqlDialect) dropView(def *view.Definition) ([]string, error) {
+	return dropViewIfExists(def)
+}
+
 var _ triggerDialect = postgresDialect{}
 var _ triggerDialect = mysqlDialect{}
+var _ viewDialect = postgresDialect{}
+var _ viewDialect = mysqlDialect{}

@@ -5,6 +5,7 @@ import (
 	"testing"
 
 	"github.com/bg12345/gorm-dbobjects/trigger"
+	"github.com/bg12345/gorm-dbobjects/view"
 )
 
 // postgresDialect.renderTrigger/renderExpr are unexported, so this test
@@ -173,5 +174,106 @@ func TestMySQLDialect_DropTrigger_StatementShape(t *testing.T) {
 	}
 	if want := "DROP TRIGGER IF EXISTS trg_user_master_before_update;"; stmts[0] != want {
 		t.Errorf("dropTrigger()[0] = %q, want %q", stmts[0], want)
+	}
+}
+
+// The Raw() path bypasses db.ToSQL entirely (renderViewCreateOrReplace
+// only calls db.ToSQL when RawSQL is empty), so these can pass a nil
+// *gorm.DB safely and stay fully DB-less -- the Query()-callback path
+// genuinely needs a live connection and is covered by integration
+// tests instead (docs/PLAN.md §3.2's testability note).
+
+func TestPostgresDialect_RenderView_Raw(t *testing.T) {
+	def := &view.Definition{
+		Name:   "active_users",
+		RawSQL: "SELECT * FROM user_master WHERE deleted_at IS NULL",
+	}
+
+	stmts, err := postgresDialect{}.renderView(nil, def)
+	if err != nil {
+		t.Fatalf("renderView() error = %v", err)
+	}
+	if len(stmts) != 1 {
+		t.Fatalf("renderView() returned %d statement(s), want 1:\n%s", len(stmts), strings.Join(stmts, "\n---\n"))
+	}
+	want := `CREATE OR REPLACE VIEW active_users AS SELECT * FROM user_master WHERE deleted_at IS NULL`
+	if stmts[0] != want {
+		t.Errorf("renderView()[0] = %q, want %q", stmts[0], want)
+	}
+}
+
+func TestMySQLDialect_RenderView_Raw(t *testing.T) {
+	def := &view.Definition{
+		Name:   "active_users",
+		RawSQL: "SELECT * FROM user_master WHERE deleted_at IS NULL",
+	}
+
+	stmts, err := mysqlDialect{}.renderView(nil, def)
+	if err != nil {
+		t.Fatalf("renderView() error = %v", err)
+	}
+	if len(stmts) != 1 {
+		t.Fatalf("renderView() returned %d statement(s), want 1:\n%s", len(stmts), strings.Join(stmts, "\n---\n"))
+	}
+	want := `CREATE OR REPLACE VIEW active_users AS SELECT * FROM user_master WHERE deleted_at IS NULL`
+	if stmts[0] != want {
+		t.Errorf("renderView()[0] = %q, want %q", stmts[0], want)
+	}
+}
+
+func TestPostgresDialect_DropView(t *testing.T) {
+	def := &view.Definition{Name: "active_users"}
+
+	stmts, err := postgresDialect{}.dropView(def)
+	if err != nil {
+		t.Fatalf("dropView() error = %v", err)
+	}
+	if len(stmts) != 1 {
+		t.Fatalf("dropView() returned %d statement(s), want 1:\n%s", len(stmts), strings.Join(stmts, "\n---\n"))
+	}
+	if want := "DROP VIEW IF EXISTS active_users;"; stmts[0] != want {
+		t.Errorf("dropView()[0] = %q, want %q", stmts[0], want)
+	}
+}
+
+func TestMySQLDialect_DropView(t *testing.T) {
+	def := &view.Definition{Name: "active_users"}
+
+	stmts, err := mysqlDialect{}.dropView(def)
+	if err != nil {
+		t.Fatalf("dropView() error = %v", err)
+	}
+	if len(stmts) != 1 {
+		t.Fatalf("dropView() returned %d statement(s), want 1:\n%s", len(stmts), strings.Join(stmts, "\n---\n"))
+	}
+	if want := "DROP VIEW IF EXISTS active_users;"; stmts[0] != want {
+		t.Errorf("dropView()[0] = %q, want %q", stmts[0], want)
+	}
+}
+
+// TestRenderView_SharedAcrossDialects guards the "share it" decision
+// (docs/PLAN.md §3.2): postgresDialect and mysqlDialect both delegate
+// to renderViewCreateOrReplace, so their output for the same Definition
+// should be byte-for-byte identical. Catches one dialect's renderView
+// accidentally diverging from the shared helper without the other
+// following, which would otherwise go unnoticed since the two are
+// tested independently above.
+func TestRenderView_SharedAcrossDialects(t *testing.T) {
+	def := &view.Definition{
+		Name:   "active_users",
+		RawSQL: "SELECT * FROM user_master WHERE deleted_at IS NULL",
+	}
+
+	pgStmts, err := postgresDialect{}.renderView(nil, def)
+	if err != nil {
+		t.Fatalf("postgresDialect renderView() error = %v", err)
+	}
+	myStmts, err := mysqlDialect{}.renderView(nil, def)
+	if err != nil {
+		t.Fatalf("mysqlDialect renderView() error = %v", err)
+	}
+	if strings.Join(pgStmts, "\n") != strings.Join(myStmts, "\n") {
+		t.Errorf("postgresDialect and mysqlDialect produced different DDL for the same Definition:\npostgres: %v\nmysql:    %v",
+			pgStmts, myStmts)
 	}
 }
