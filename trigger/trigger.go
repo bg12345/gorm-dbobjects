@@ -44,14 +44,24 @@ func Raw(sql string) Expr {
 type Definition struct {
 	Table  string
 	Timing string // "BEFORE" or "AFTER"
-	Event  string // "INSERT" or "UPDATE"
+	Event  string // "INSERT", "UPDATE", or "DELETE"
 	Sets   map[string]Expr
+	Body   string // raw full trigger body; required for DELETE (no NEW row to assign into)
 	Name   string // optional; if empty, dbobjects will generate one
+
+	// PrimaryKey is the table's single primary key column, set only when
+	// Timing is AFTER and Sets is non-empty. NEW isn't assignable once an
+	// AFTER trigger fires (the row's already written), so the dialect
+	// renders Set() there as an explicit follow-up UPDATE targeting this
+	// column instead of NEW.col = expr -- see dialect.go's renderTrigger.
+	PrimaryKey string
 }
 
 type Trigger interface {
 	Kind() string
 	Set(column string, value Expr) Trigger
+	SetColumns(columns map[string]Expr) Trigger
+	Body(sql string) Trigger
 	Name(n string) Trigger
 	Build() (*Definition, error)
 }
@@ -63,6 +73,7 @@ type triggerBuilder struct {
 	sets   map[string]Expr
 	err    error
 	name   string
+	body   string
 }
 
 func newTrigger(model any, timing, event string) Trigger {
@@ -73,6 +84,7 @@ func newTrigger(model any, timing, event string) Trigger {
 		event:  event,
 		sets:   map[string]Expr{},
 		err:    err,
+		body:   "",
 	}
 }
 
@@ -84,8 +96,34 @@ func BeforeUpdate(model any) Trigger {
 	return newTrigger(model, "BEFORE", "UPDATE")
 }
 
+func AfterInsert(model any) Trigger {
+	return newTrigger(model, "AFTER", "INSERT")
+}
+
+func AfterUpdate(model any) Trigger {
+	return newTrigger(model, "AFTER", "UPDATE")
+}
+
+func BeforeDelete(model any) Trigger {
+	return newTrigger(model, "BEFORE", "DELETE")
+}
+
+func AfterDelete(model any) Trigger {
+	return newTrigger(model, "AFTER", "DELETE")
+}
+
+func (t *triggerBuilder) Body(sql string) Trigger {
+	t.body = sql
+	return t
+}
+
+
 func (t *triggerBuilder) Set(column string, value Expr) Trigger {
 	if t.err != nil {
+		return t
+	}
+	if t.event == "DELETE" {
+		t.err = fmt.Errorf("trigger: Set is not valid on a DELETE trigger (no NEW row); use Body instead")
 		return t
 	}
 	if _, ok := t.schema.FieldsByDBName[column]; !ok {
@@ -96,19 +134,52 @@ func (t *triggerBuilder) Set(column string, value Expr) Trigger {
 	return t
 }
 
+func (t *triggerBuilder) SetColumns(columns map[string]Expr) Trigger {
+	if t.err != nil {
+		return t
+	}
+	if t.event == "DELETE" {
+		t.err = fmt.Errorf("trigger: Set is not valid on a DELETE trigger (no NEW row); use Body instead")
+		return t
+	}
+	for column, value := range columns {
+		if _, ok := t.schema.FieldsByDBName[column]; !ok {
+			t.err = fmt.Errorf("trigger: column %q not found on table %q", column, t.schema.Table)
+			return t
+		}
+		t.sets[column] = value
+	}
+	return t
+}
+
 func (t *triggerBuilder) Build() (*Definition, error) {
 	if t.err != nil {
 		return nil, t.err
 	}
-	if len(t.sets) == 0 {
-		return nil, fmt.Errorf("trigger: no columns set for table %q", t.schema.Table)
+	if len(t.sets) == 0 && t.body == "" {
+		return nil, fmt.Errorf("trigger: no columns set and no Body provided for table %q", t.schema.Table)
 	}
+
+	var pk string
+	if t.timing == "AFTER" && len(t.sets) > 0 {
+		// AFTER-trigger Set() renders as a follow-up UPDATE (see
+		// Definition.PrimaryKey / dialect.go's renderTrigger), which
+		// needs exactly one primary key column to target the right row.
+		if len(t.schema.PrimaryFields) != 1 {
+			return nil, fmt.Errorf("trigger: AFTER trigger with Set() requires exactly one primary key column on table %q, found %d",
+				t.schema.Table, len(t.schema.PrimaryFields))
+		}
+		pk = t.schema.PrimaryFields[0].DBName
+	}
+
 	return &Definition{
-		Table:  t.schema.Table,
-		Timing: t.timing,
-		Event:  t.event,
-		Sets:   t.sets,
-		Name:   t.name,
+		Table:      t.schema.Table,
+		Timing:     t.timing,
+		Event:      t.event,
+		Sets:       t.sets,
+		Body:       t.body,
+		Name:       t.name,
+		PrimaryKey: pk,
 	}, nil
 }
 

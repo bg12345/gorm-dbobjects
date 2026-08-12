@@ -70,6 +70,114 @@ func TestPostgresDialect_RenderTrigger_RawEndToEnd(t *testing.T) {
 	}
 }
 
+// AFTER triggers can't assign to NEW (the row's already written), so
+// Set() on an AFTER trigger renders as a follow-up UPDATE targeting the
+// row via its primary key instead of NEW.col = expr. These four tests
+// guard that shape plus its two recursion guards -- Postgres's
+// pg_trigger_depth() and MySQL's session-variable-plus-EXIT-HANDLER --
+// since a rendering regression here would silently reintroduce the
+// infinite-recursion bug the guards exist to prevent.
+
+func TestPostgresDialect_RenderTrigger_AfterUpdateSetEndToEnd(t *testing.T) {
+	def := &trigger.Definition{
+		Table:      "accounts",
+		Timing:     "AFTER",
+		Event:      "UPDATE",
+		Sets:       map[string]trigger.Expr{"status": trigger.Raw("'synced'")},
+		PrimaryKey: "id",
+	}
+
+	stmts, err := postgresDialect{}.renderTrigger(def)
+	if err != nil {
+		t.Fatalf("renderTrigger() error = %v", err)
+	}
+	sql := strings.Join(stmts, "\n")
+	for _, want := range []string{
+		"IF pg_trigger_depth() > 1 THEN RETURN NULL; END IF;",
+		"UPDATE accounts SET status = 'synced' WHERE id = NEW.id;",
+	} {
+		if !strings.Contains(sql, want) {
+			t.Errorf("renderTrigger() output missing %q, got:\n%s", want, sql)
+		}
+	}
+	if strings.Contains(sql, "NEW.status = ") {
+		t.Errorf("renderTrigger() should not assign NEW.status directly on an AFTER trigger, got:\n%s", sql)
+	}
+}
+
+func TestPostgresDialect_RenderTrigger_AfterInsertSetEndToEnd(t *testing.T) {
+	def := &trigger.Definition{
+		Table:      "accounts",
+		Timing:     "AFTER",
+		Event:      "INSERT",
+		Sets:       map[string]trigger.Expr{"status": trigger.Raw("'new'")},
+		PrimaryKey: "id",
+	}
+
+	stmts, err := postgresDialect{}.renderTrigger(def)
+	if err != nil {
+		t.Fatalf("renderTrigger() error = %v", err)
+	}
+	sql := strings.Join(stmts, "\n")
+	if want := "UPDATE accounts SET status = 'new' WHERE id = NEW.id;"; !strings.Contains(sql, want) {
+		t.Errorf("renderTrigger() output missing %q, got:\n%s", want, sql)
+	}
+	// AFTER INSERT can't recurse into itself via this UPDATE (it's not
+	// another INSERT), so no pg_trigger_depth() guard is expected here.
+	if strings.Contains(sql, "pg_trigger_depth") {
+		t.Errorf("renderTrigger() should not need a recursion guard on AFTER INSERT, got:\n%s", sql)
+	}
+}
+
+func TestMySQLDialect_RenderTrigger_AfterUpdateSetEndToEnd(t *testing.T) {
+	def := &trigger.Definition{
+		Table:      "accounts",
+		Timing:     "AFTER",
+		Event:      "UPDATE",
+		Sets:       map[string]trigger.Expr{"status": trigger.Raw("'synced'")},
+		PrimaryKey: "id",
+		Name:       "trg_accounts_after_update",
+	}
+
+	stmts, err := mysqlDialect{}.renderTrigger(def)
+	if err != nil {
+		t.Fatalf("renderTrigger() error = %v", err)
+	}
+	sql := strings.Join(stmts, "\n")
+	for _, want := range []string{
+		"@dbobjects_guard_trg_accounts_after_update IS NULL",
+		"DECLARE EXIT HANDLER FOR SQLEXCEPTION",
+		"RESIGNAL;",
+		"UPDATE accounts SET status = 'synced' WHERE id = NEW.id;",
+	} {
+		if !strings.Contains(sql, want) {
+			t.Errorf("renderTrigger() output missing %q, got:\n%s", want, sql)
+		}
+	}
+}
+
+func TestMySQLDialect_RenderTrigger_AfterInsertSetEndToEnd(t *testing.T) {
+	def := &trigger.Definition{
+		Table:      "accounts",
+		Timing:     "AFTER",
+		Event:      "INSERT",
+		Sets:       map[string]trigger.Expr{"status": trigger.Raw("'new'")},
+		PrimaryKey: "id",
+	}
+
+	stmts, err := mysqlDialect{}.renderTrigger(def)
+	if err != nil {
+		t.Fatalf("renderTrigger() error = %v", err)
+	}
+	sql := strings.Join(stmts, "\n")
+	if want := "UPDATE accounts SET status = 'new' WHERE id = NEW.id;"; !strings.Contains(sql, want) {
+		t.Errorf("renderTrigger() output missing %q, got:\n%s", want, sql)
+	}
+	if strings.Contains(sql, "DECLARE EXIT HANDLER") {
+		t.Errorf("renderTrigger() should not need the recursion-guard handler on AFTER INSERT, got:\n%s", sql)
+	}
+}
+
 func TestMySQLDialect_RenderExpr(t *testing.T) {
 	d := mysqlDialect{}
 	tests := []struct {

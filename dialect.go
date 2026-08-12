@@ -93,28 +93,62 @@ func triggerNames(def *trigger.Definition) (fnName, trgName string) {
 		fmt.Sprintf("trg_%s_%s_%s", def.Table, timing, event)
 }
 
-func (d postgresDialect) renderTrigger(def *trigger.Definition) ([]string, error) {
-	fnName, trgName := triggerNames(def)
-
-	columns := make([]string, 0, len(def.Sets))
-	for column := range def.Sets {
+// sortedSetColumns returns the columns of sets in sorted order, so
+// generated SQL is deterministic across Go's randomized map iteration.
+func sortedSetColumns(sets map[string]trigger.Expr) []string {
+	columns := make([]string, 0, len(sets))
+	for column := range sets {
 		columns = append(columns, column)
 	}
 	sort.Strings(columns)
+	return columns
+}
+
+func (d postgresDialect) renderTrigger(def *trigger.Definition) ([]string, error) {
+	fnName, trgName := triggerNames(def)
+	columns := sortedSetColumns(def.Sets)
 
 	var body strings.Builder
-	for _, column := range columns {
-		fmt.Fprintf(&body, "  NEW.%s = %s;\n", column, d.renderExpr(def.Sets[column]))
+	switch {
+	case def.Body != "":
+		fmt.Fprintf(&body, "  %s\n", def.Body)
+	case def.Timing == "AFTER":
+		// NEW isn't assignable once an AFTER trigger fires -- the row's
+		// already written -- so Set() renders as an explicit follow-up
+		// UPDATE targeting the row via its primary key instead of
+		// NEW.col = expr (see Definition.PrimaryKey).
+		assigns := make([]string, len(columns))
+		for i, column := range columns {
+			assigns[i] = fmt.Sprintf("%s = %s", column, d.renderExpr(def.Sets[column]))
+		}
+		if def.Event == "UPDATE" {
+			// This UPDATE re-fires this same AFTER UPDATE trigger.
+			// pg_trigger_depth() > 1 means we're already inside that
+			// recursive firing -- skip the body there so the follow-up
+			// UPDATE runs exactly once per original statement, not
+			// forever.
+			fmt.Fprintf(&body, "  IF pg_trigger_depth() > 1 THEN RETURN NULL; END IF;\n")
+		}
+		fmt.Fprintf(&body, "  UPDATE %s SET %s WHERE %s = NEW.%s;\n",
+			def.Table, strings.Join(assigns, ", "), def.PrimaryKey, def.PrimaryKey)
+	default:
+		for _, column := range columns {
+			fmt.Fprintf(&body, "  NEW.%s = %s;\n", column, d.renderExpr(def.Sets[column]))
+		}
+	}
+
+	retVar := "NEW"
+	if def.Event == "DELETE" {
+		retVar = "OLD"
 	}
 
 	createFn := fmt.Sprintf(`CREATE OR REPLACE FUNCTION %s() RETURNS TRIGGER AS $$
 BEGIN
-%s  RETURN NEW;
+%s  RETURN %s;
 END;
-$$ LANGUAGE plpgsql;`, fnName, body.String())
+$$ LANGUAGE plpgsql;`, fnName, body.String(), retVar)
 
 	dropTrg := fmt.Sprintf(`DROP TRIGGER IF EXISTS %s ON %s;`, trgName, def.Table)
-
 	createTrg := fmt.Sprintf(`CREATE TRIGGER %s %s %s ON %s
 FOR EACH ROW EXECUTE FUNCTION %s();`, trgName, def.Timing, def.Event, def.Table, fnName)
 
@@ -132,16 +166,59 @@ func (postgresDialect) dropTrigger(def *trigger.Definition) ([]string, error) {
 
 func (d mysqlDialect) renderTrigger(def *trigger.Definition) ([]string, error) {
 	_, trgName := triggerNames(def)
-
-	columns := make([]string, 0, len(def.Sets))
-	for column := range def.Sets {
-		columns = append(columns, column)
-	}
-	sort.Strings(columns)
+	columns := sortedSetColumns(def.Sets)
 
 	var body strings.Builder
-	for _, column := range columns {
-		fmt.Fprintf(&body, "  SET NEW.%s = %s;\n", column, d.renderExpr(def.Sets[column]))
+	switch {
+	case def.Body != "":
+		fmt.Fprintf(&body, "  %s\n", def.Body)
+	case def.Timing == "AFTER":
+		// NEW isn't assignable in a MySQL AFTER trigger at all ("Updating
+		// of NEW row is not allowed in after trigger"), so Set() renders
+		// as an explicit follow-up UPDATE targeting the row via its
+		// primary key instead (see Definition.PrimaryKey).
+		assigns := make([]string, len(columns))
+		for i, column := range columns {
+			assigns[i] = fmt.Sprintf("%s = %s", column, d.renderExpr(def.Sets[column]))
+		}
+		updateStmt := fmt.Sprintf("UPDATE %s SET %s WHERE %s = NEW.%s;",
+			def.Table, strings.Join(assigns, ", "), def.PrimaryKey, def.PrimaryKey)
+		if def.Event == "UPDATE" {
+			// MySQL has no pg_trigger_depth() equivalent to detect a
+			// recursive firing. This UPDATE re-fires this same AFTER
+			// UPDATE trigger, so a session variable stands in as a
+			// manual reentrancy guard -- the recursive firing sees it
+			// already set and skips its own UPDATE.
+			//
+			// A nested EXIT HANDLER FOR SQLEXCEPTION wraps just the
+			// UPDATE: DECLARE HANDLER must be the first statement in
+			// its enclosing BEGIN...END, hence the extra nesting. If
+			// the UPDATE errors, the handler resets the guard *before*
+			// RESIGNALing the original error, so a failed statement
+			// doesn't leave the guard stuck at 1 for the rest of this
+			// (possibly pooled) session -- session variables survive a
+			// rolled-back statement, unlike table data.
+			guardVar := "@dbobjects_guard_" + trgName
+			fmt.Fprintf(&body, `  IF %[1]s IS NULL THEN
+    SET %[1]s = 1;
+    BEGIN
+      DECLARE EXIT HANDLER FOR SQLEXCEPTION
+      BEGIN
+        SET %[1]s = NULL;
+        RESIGNAL;
+      END;
+      %[2]s
+      SET %[1]s = NULL;
+    END;
+  END IF;
+`, guardVar, updateStmt)
+		} else {
+			fmt.Fprintf(&body, "  %s\n", updateStmt)
+		}
+	default:
+		for _, column := range columns {
+			fmt.Fprintf(&body, "  SET NEW.%s = %s;\n", column, d.renderExpr(def.Sets[column]))
+		}
 	}
 
 	createStmt := fmt.Sprintf(`CREATE TRIGGER %s %s %s ON %s
@@ -149,7 +226,6 @@ FOR EACH ROW BEGIN
 %sEND;`, trgName, def.Timing, def.Event, def.Table, body.String())
 
 	dropStmt := fmt.Sprintf(`DROP TRIGGER IF EXISTS %s;`, trgName)
-
 	return []string{dropStmt, createStmt}, nil
 }
 
