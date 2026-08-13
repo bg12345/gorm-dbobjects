@@ -682,9 +682,9 @@ func TestRegister_MySQL_AppliesAfterUpdateTrigger(t *testing.T) {
 }
 
 // TestRegister_MySQL_CompensatesOnFailure is an integration test: it
-// connects to a real MySQL (transactional() == false, docs/PLAN.md §2.5
-// -- the only dialect that exercises Register's compensating-rollback
-// path) and verifies that when a later object in one Register call
+// connects to a real MySQL (transactional() == false -- the only
+// dialect that exercises Register's compensating-rollback path) and
+// verifies that when a later object in one Register call
 // fails, an earlier object that already succeeded gets compensated
 // (dropped) rather than left behind half-applied. The second trigger is
 // engineered to fail at *execution* time via an intentionally invalid

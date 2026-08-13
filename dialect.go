@@ -13,11 +13,13 @@ import (
 
 type triggerDialect interface {
 	renderTrigger(def *trigger.Definition) ([]string, error)
+	renderTriggerDeclarative(def *trigger.Definition) ([]string, error)
 	dropTrigger(def *trigger.Definition) ([]string, error)
 }
 
 type viewDialect interface {
 	renderView(db *gorm.DB, def *view.Definition) ([]string, error)
+	renderViewDeclarative(db *gorm.DB, def *view.Definition) ([]string, error)
 	dropView(def *view.Definition) ([]string, error)
 }
 
@@ -104,14 +106,18 @@ func sortedSetColumns(sets map[string]trigger.Expr) []string {
 	return columns
 }
 
-func (d postgresDialect) renderTrigger(def *trigger.Definition) ([]string, error) {
-	fnName, trgName := triggerNames(def)
+// triggerBody renders the BEGIN...END body for def's trigger function and
+// the RETURN variable (NEW/OLD) it should use. Shared by renderTrigger
+// and renderTriggerDeclarative so the two variants can never diverge on
+// body content -- only the outer wrapper (CREATE OR REPLACE vs bare
+// CREATE, presence/absence of a DROP) differs between them.
+func (d postgresDialect) triggerBody(def *trigger.Definition) (body, retVar string) {
 	columns := sortedSetColumns(def.Sets)
 
-	var body strings.Builder
+	var b strings.Builder
 	switch {
 	case def.Body != "":
-		fmt.Fprintf(&body, "  %s\n", def.Body)
+		fmt.Fprintf(&b, "  %s\n", def.Body)
 	case def.Timing == "AFTER":
 		// NEW isn't assignable once an AFTER trigger fires -- the row's
 		// already written -- so Set() renders as an explicit follow-up
@@ -127,32 +133,64 @@ func (d postgresDialect) renderTrigger(def *trigger.Definition) ([]string, error
 			// recursive firing -- skip the body there so the follow-up
 			// UPDATE runs exactly once per original statement, not
 			// forever.
-			fmt.Fprintf(&body, "  IF pg_trigger_depth() > 1 THEN RETURN NULL; END IF;\n")
+			fmt.Fprintf(&b, "  IF pg_trigger_depth() > 1 THEN RETURN NULL; END IF;\n")
 		}
-		fmt.Fprintf(&body, "  UPDATE %s SET %s WHERE %s = NEW.%s;\n",
+		fmt.Fprintf(&b, "  UPDATE %s SET %s WHERE %s = NEW.%s;\n",
 			def.Table, strings.Join(assigns, ", "), def.PrimaryKey, def.PrimaryKey)
 	default:
 		for _, column := range columns {
-			fmt.Fprintf(&body, "  NEW.%s = %s;\n", column, d.renderExpr(def.Sets[column]))
+			fmt.Fprintf(&b, "  NEW.%s = %s;\n", column, d.renderExpr(def.Sets[column]))
 		}
 	}
 
-	retVar := "NEW"
+	retVar = "NEW"
 	if def.Event == "DELETE" {
 		retVar = "OLD"
 	}
+	return b.String(), retVar
+}
+
+// createTriggerStmt renders the CREATE TRIGGER statement itself -- shared
+// by renderTrigger and renderTriggerDeclarative since this part never
+// has a conditional form to strip (Postgres's CREATE TRIGGER has no
+// bare-vs-OR-REPLACE distinction; only the backing function does).
+func (postgresDialect) createTriggerStmt(def *trigger.Definition, fnName, trgName string) string {
+	return fmt.Sprintf(`CREATE TRIGGER %s %s %s ON %s
+FOR EACH ROW EXECUTE FUNCTION %s();`, trgName, def.Timing, def.Event, def.Table, fnName)
+}
+
+func (d postgresDialect) renderTrigger(def *trigger.Definition) ([]string, error) {
+	fnName, trgName := triggerNames(def)
+	body, retVar := d.triggerBody(def)
 
 	createFn := fmt.Sprintf(`CREATE OR REPLACE FUNCTION %s() RETURNS TRIGGER AS $$
 BEGIN
 %s  RETURN %s;
 END;
-$$ LANGUAGE plpgsql;`, fnName, body.String(), retVar)
+$$ LANGUAGE plpgsql;`, fnName, body, retVar)
 
 	dropTrg := fmt.Sprintf(`DROP TRIGGER IF EXISTS %s ON %s;`, trgName, def.Table)
-	createTrg := fmt.Sprintf(`CREATE TRIGGER %s %s %s ON %s
-FOR EACH ROW EXECUTE FUNCTION %s();`, trgName, def.Timing, def.Event, def.Table, fnName)
 
-	return []string{createFn, dropTrg, createTrg}, nil
+	return []string{createFn, dropTrg, d.createTriggerStmt(def, fnName, trgName)}, nil
+}
+
+// renderTriggerDeclarative renders def as bare CREATE statements -- no
+// CREATE OR REPLACE, no DROP -- for structural DDL consumers (e.g. an
+// Atlas external schema source) that parse and diff desired-state SQL
+// themselves rather than executing conditional DDL directly. Shares
+// triggerBody/createTriggerStmt with renderTrigger so the two can never
+// render different body content for the same def.
+func (d postgresDialect) renderTriggerDeclarative(def *trigger.Definition) ([]string, error) {
+	fnName, trgName := triggerNames(def)
+	body, retVar := d.triggerBody(def)
+
+	createFn := fmt.Sprintf(`CREATE FUNCTION %s() RETURNS TRIGGER AS $$
+BEGIN
+%s  RETURN %s;
+END;
+$$ LANGUAGE plpgsql;`, fnName, body, retVar)
+
+	return []string{createFn, d.createTriggerStmt(def, fnName, trgName)}, nil
 }
 
 func (postgresDialect) dropTrigger(def *trigger.Definition) ([]string, error) {
@@ -164,8 +202,13 @@ func (postgresDialect) dropTrigger(def *trigger.Definition) ([]string, error) {
 	}, nil
 }
 
-func (d mysqlDialect) renderTrigger(def *trigger.Definition) ([]string, error) {
-	_, trgName := triggerNames(def)
+// triggerBody renders the BEGIN...END body for def's trigger -- shared
+// by renderTrigger and renderTriggerDeclarative so the two variants can
+// never diverge on body content -- only the outer CREATE/DROP wrapper
+// differs between them. trgName is needed here (not just by the caller)
+// because the AFTER UPDATE recursion guard's session-variable name is
+// scoped by trigger name.
+func (d mysqlDialect) triggerBody(def *trigger.Definition, trgName string) string {
 	columns := sortedSetColumns(def.Sets)
 
 	var body strings.Builder
@@ -220,13 +263,33 @@ func (d mysqlDialect) renderTrigger(def *trigger.Definition) ([]string, error) {
 			fmt.Fprintf(&body, "  SET NEW.%s = %s;\n", column, d.renderExpr(def.Sets[column]))
 		}
 	}
+	return body.String()
+}
 
-	createStmt := fmt.Sprintf(`CREATE TRIGGER %s %s %s ON %s
+// createTriggerStmt renders the CREATE TRIGGER statement itself -- shared
+// by renderTrigger and renderTriggerDeclarative, since MySQL has no
+// CREATE OR REPLACE TRIGGER to begin with: this part of the output is
+// already identical between idempotent and declarative modes.
+func (mysqlDialect) createTriggerStmt(def *trigger.Definition, trgName, body string) string {
+	return fmt.Sprintf(`CREATE TRIGGER %s %s %s ON %s
 FOR EACH ROW BEGIN
-%sEND;`, trgName, def.Timing, def.Event, def.Table, body.String())
+%sEND;`, trgName, def.Timing, def.Event, def.Table, body)
+}
 
+func (d mysqlDialect) renderTrigger(def *trigger.Definition) ([]string, error) {
+	_, trgName := triggerNames(def)
 	dropStmt := fmt.Sprintf(`DROP TRIGGER IF EXISTS %s;`, trgName)
-	return []string{dropStmt, createStmt}, nil
+	return []string{dropStmt, d.createTriggerStmt(def, trgName, d.triggerBody(def, trgName))}, nil
+}
+
+// renderTriggerDeclarative renders def as a single bare CREATE TRIGGER
+// statement -- no DROP -- for structural DDL consumers (e.g. an Atlas
+// external schema source). MySQL has no CREATE OR REPLACE TRIGGER, so
+// unlike Postgres there's no second conditional to strip; omitting the
+// DROP is the only difference from renderTrigger.
+func (d mysqlDialect) renderTriggerDeclarative(def *trigger.Definition) ([]string, error) {
+	_, trgName := triggerNames(def)
+	return []string{d.createTriggerStmt(def, trgName, d.triggerBody(def, trgName))}, nil
 }
 
 func (d mysqlDialect) dropTrigger(def *trigger.Definition) ([]string, error) {
@@ -238,31 +301,44 @@ func (d mysqlDialect) dropTrigger(def *trigger.Definition) ([]string, error) {
 }
 
 
+// resolveViewBody returns def's view body: RawSQL verbatim if set,
+// otherwise fully-interpolated SQL from QueryFn via db.ToSQL. Shared by
+// renderViewCreateOrReplace and renderViewCreate so the two can never
+// diverge on body content -- only the outer CREATE OR REPLACE vs bare
+// CREATE wrapper differs.
+//
+// ToSQL only populates stmt.SQL once a finisher method (Find, First,
+// ...) runs gorm's query callback chain -- .Model()/.Where() alone just
+// accumulate clauses on the Statement. view.Query(fn) deliberately
+// doesn't require callers to know that (no .Find(&dest) in their
+// callback), so it's appended here instead. The destination is a
+// generic map, not the caller's model type, since this layer never
+// knows that type -- it relies on .Model() already being set inside fn
+// to determine what gets selected.
+func resolveViewBody(db *gorm.DB, def *view.Definition) string {
+	if def.RawSQL != "" {
+		return def.RawSQL
+	}
+	return db.ToSQL(func(tx *gorm.DB) *gorm.DB {
+		return def.QueryFn(tx).Find(&[]map[string]any{})
+	})
+}
+
 // renderViewCreateOrReplace renders def as a CREATE OR REPLACE VIEW
 // statement -- shared by postgresDialect and mysqlDialect since both
 // support identical syntax here, unlike triggers where the two engines
 // diverge structurally (SQL Server's CREATE OR ALTER and SQLite's lack
 // of CREATE OR REPLACE will need their own implementations later).
-// Resolves RawSQL verbatim if set; otherwise invokes QueryFn via
-// db.ToSQL to get fully-interpolated literal SQL, since a CREATE VIEW
-// body can't carry bind parameters the way a normal query can.
 func renderViewCreateOrReplace(db *gorm.DB, def *view.Definition) ([]string, error) {
-	body := def.RawSQL
-	if body == "" {
-		// ToSQL only populates stmt.SQL once a finisher method (Find,
-		// First, ...) runs gorm's query callback chain -- .Model()/
-		// .Where() alone just accumulate clauses on the Statement.
-		// view.Query(fn) deliberately doesn't require callers to know
-		// that (no .Find(&dest) in their callback), so it's appended
-		// here instead. The destination is a generic map, not the
-		// caller's model type, since this layer never knows that type
-		// -- it relies on .Model() already being set inside fn to
-		// determine what gets selected.
-		body = db.ToSQL(func(tx *gorm.DB) *gorm.DB {
-			return def.QueryFn(tx).Find(&[]map[string]any{})
-		})
-	}
-	return []string{fmt.Sprintf(`CREATE OR REPLACE VIEW %s AS %s`, def.Name, body)}, nil
+	return []string{fmt.Sprintf(`CREATE OR REPLACE VIEW %s AS %s`, def.Name, resolveViewBody(db, def))}, nil
+}
+
+// renderViewCreate renders def as a bare CREATE VIEW statement -- no OR
+// REPLACE -- for structural DDL consumers (e.g. an Atlas external
+// schema source). Shared by both dialects for the same reason
+// renderViewCreateOrReplace is.
+func renderViewCreate(db *gorm.DB, def *view.Definition) ([]string, error) {
+	return []string{fmt.Sprintf(`CREATE VIEW %s AS %s`, def.Name, resolveViewBody(db, def))}, nil
 }
 
 // dropViewIfExists renders a DROP VIEW IF EXISTS statement -- shared
@@ -275,12 +351,20 @@ func (postgresDialect) renderView(db *gorm.DB, def *view.Definition) ([]string, 
 	return renderViewCreateOrReplace(db, def)
 }
 
+func (postgresDialect) renderViewDeclarative(db *gorm.DB, def *view.Definition) ([]string, error) {
+	return renderViewCreate(db, def)
+}
+
 func (postgresDialect) dropView(def *view.Definition) ([]string, error) {
 	return dropViewIfExists(def)
 }
 
 func (mysqlDialect) renderView(db *gorm.DB, def *view.Definition) ([]string, error) {
 	return renderViewCreateOrReplace(db, def)
+}
+
+func (mysqlDialect) renderViewDeclarative(db *gorm.DB, def *view.Definition) ([]string, error) {
+	return renderViewCreate(db, def)
 }
 
 func (mysqlDialect) dropView(def *view.Definition) ([]string, error) {
