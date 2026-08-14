@@ -106,6 +106,26 @@ func main() {
 connected to — the dialect that generates the actual DDL is resolved
 from the connection itself.
 
+All six `BEFORE`/`AFTER` × `INSERT`/`UPDATE`/`DELETE` combinations are
+supported. `Set()`/`SetColumns()` assign `NEW` columns and work on any
+`INSERT`/`UPDATE` trigger — including `AfterInsert`/`AfterUpdate`, where
+`dbobjects` renders them as a follow-up `UPDATE` under the hood, since
+`NEW` itself isn't assignable once an `AFTER` trigger fires:
+
+```go
+tr := trigger.AfterUpdate(&User{}).
+    Set("updated_at", trigger.Now())
+```
+
+`DELETE` triggers have no `NEW` row to assign into at all, so they use
+`Body()` — a raw-SQL escape hatch also available on any other trigger
+for logic `Set()` can't express:
+
+```go
+tr := trigger.AfterDelete(&User{}).
+    Body("INSERT INTO user_audit(user_id, action) VALUES (OLD.id, 'deleted');")
+```
+
 Views work the same way, built from a gorm query callback instead of a
 raw SQL string — `dbobjects` reuses gorm's own dialect layer to resolve
 it, so the same view definition renders correctly on whichever engine
@@ -173,6 +193,17 @@ the same way [`atlas-provider-gorm`](https://github.com/ariga/atlas-provider-gor
 already does for gorm's own table schema, so Atlas can diff and version
 triggers/views/procedures alongside the rest of your schema instead of
 around it.
+
+`Render` has two modes. `Idempotent` is the same conditional DDL
+`Register` executes (`CREATE OR REPLACE`, `DROP ... IF EXISTS`) — safe
+to review or re-run directly. `Declarative` strips that down to bare
+`CREATE` statements with no conditionals, since a structural tool like
+Atlas parses the DDL itself and computes its own diff — conditional SQL
+just gets in its way:
+
+```go
+stmts, _ := dbobjects.Render([]dbobjects.DBObject{tr}, dbobjects.Declarative)
+```
 
 ## Testing
 
