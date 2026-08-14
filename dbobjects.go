@@ -45,12 +45,15 @@ func resolveDialect(op string) (dialect, error) {
 	return d, nil
 }
 
-// ddlOp selects which dialect method resolveDDL calls for a kind --
-// its create/replace method (opRender) or its drop method (opDrop).
+// ddlOp selects which dialect method resolveDDL calls for a kind: its
+// idempotent create/replace method (opRender), its bare-CREATE
+// structural-DDL method (opRenderDeclarative, see RenderMode), or its
+// drop method (opDrop).
 type ddlOp int
 
 const (
 	opRender ddlOp = iota
+	opRenderDeclarative
 	opDrop
 )
 
@@ -58,9 +61,8 @@ const (
 // desc is a short, kind-formatted description of obj (e.g. `trigger on
 // "user_master"`) for the caller's own error wrapping -- each kind case
 // formats desc from whatever fields its concrete Definition actually
-// has (trigger has Table; a future procedure has no table at all, per
-// docs/PLAN.md §3.3), so nothing forces a field across kinds that don't
-// share one.
+// has (trigger has Table; a future procedure has no table at all), so
+// nothing forces a field across kinds that don't share one.
 func resolveDDL(d dialect, obj DBObject, op ddlOp) (stmts []string, desc, name string, err error) {
 	switch o := obj.(type) {
 	case trigger.Trigger:
@@ -74,9 +76,12 @@ func resolveDDL(d dialect, obj DBObject, op ddlOp) (stmts []string, desc, name s
 		}
 		_, trgName := triggerNames(def)
 		desc = fmt.Sprintf("trigger on %q", def.Table)
-		if op == opDrop {
+		switch op {
+		case opDrop:
 			stmts, err = td.dropTrigger(def)
-		} else {
+		case opRenderDeclarative:
+			stmts, err = td.renderTriggerDeclarative(def)
+		default:
 			stmts, err = td.renderTrigger(def)
 		}
 		return stmts, desc, trgName, err
@@ -90,9 +95,12 @@ func resolveDDL(d dialect, obj DBObject, op ddlOp) (stmts []string, desc, name s
 			return nil, "", "", fmt.Errorf("dbobjects: dialect %q does not support views", d.Name())
 		}
 		desc = fmt.Sprintf("view %q", def.Name)
-		if op == opDrop {
+		switch op {
+		case opDrop:
 			stmts, err = vd.dropView(def)
-		} else {
+		case opRenderDeclarative:
+			stmts, err = vd.renderViewDeclarative(db, def)
+		default:
 			stmts, err = vd.renderView(db, def)
 		}
 		return stmts, desc, def.Name, err
@@ -218,17 +226,22 @@ func Drop(ctx context.Context, objects ...DBObject) error {
 	return nil
 }
 
-// RenderMode selects the DDL flavor Render produces (see docs/PLAN.md §3.5).
+// RenderMode selects the DDL flavor Render produces.
 type RenderMode int
 
 const (
 	// Idempotent is safe to execute directly and repeatedly -- CREATE OR
 	// REPLACE, DROP ... IF EXISTS. The same DDL Register/Drop execute.
 	Idempotent RenderMode = iota
-	// Declarative strips conditionals down to bare CREATE statements, for
-	// tools that parse and diff DDL structurally (e.g. Atlas). Reserved
-	// for the migration-tool interop work in docs/PLAN.md §3.6 -- not
-	// implemented for any dialect yet.
+	// Declarative strips conditionals down to bare CREATE statements (no
+	// OR REPLACE, no DROP), for tools that parse and diff DDL
+	// structurally themselves (e.g. Atlas as an external schema source)
+	// rather than executing conditional DDL directly.
+	// Not meant for repeated direct execution: re-running the same
+	// Declarative output twice against a live DB will error on the
+	// second run (object already exists) -- that's correct, expected
+	// behavior for this mode, not a bug. Use Idempotent for anything
+	// that needs to be safely re-runnable.
 	Declarative
 )
 
@@ -238,13 +251,15 @@ func Render(objects []DBObject, mode RenderMode) ([]string, error) {
 	if err != nil {
 		return nil, err
 	}
+
+	op := opRender
 	if mode == Declarative {
-		return nil, fmt.Errorf("dbobjects: Declarative render mode is not implemented yet")
+		op = opRenderDeclarative
 	}
 
 	out := make([]string, 0, len(objects))
 	for _, obj := range objects {
-		stmts, _,_, err := resolveDDL(d, obj, opRender)
+		stmts, _,_, err := resolveDDL(d, obj, op)
 		if err != nil {
 			return nil, err
 		}
