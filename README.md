@@ -23,7 +23,7 @@ engine you're actually connected to.
 tr := trigger.BeforeUpdate(&User{}).
     Set("updated_at", trigger.Now())
 
-if err := dbobjects.Register(ctx, tr); err != nil {
+if err := client.Register(ctx, tr); err != nil {
     log.Fatal(err)
 }
 ```
@@ -81,21 +81,21 @@ func main() {
         log.Fatal(err)
     }
 
-    // Init once, wherever you already set up your *gorm.DB.
-    dbobjects.Init(db)
+    // Wrap your *gorm.DB once, wherever you already set it up.
+    client := dbobjects.NewClient(db)
 
     tr := trigger.BeforeUpdate(&User{}).
         Set("updated_at", trigger.Now())
 
-    if err := dbobjects.Register(context.Background(), tr); err != nil {
+    if err := client.Register(context.Background(), tr); err != nil {
         log.Fatal(err)
     }
 
     // Tear it back down if you ever need to.
-    _ = dbobjects.Drop(context.Background(), tr)
+    _ = client.Drop(context.Background(), tr)
 
     // Or just see the generated SQL without touching the DB.
-    stmts, _ := dbobjects.Render([]dbobjects.DBObject{tr}, dbobjects.Idempotent)
+    stmts, _ := client.Render([]dbobjects.DBObject{tr}, dbobjects.Idempotent)
     for _, s := range stmts {
         log.Println(s)
     }
@@ -104,7 +104,9 @@ func main() {
 
 `Register`/`Drop` work the same way regardless of which engine `db` is
 connected to — the dialect that generates the actual DDL is resolved
-from the connection itself.
+from the connection itself. `Client` is a thin wrapper around your
+`*gorm.DB`; construct one per connection rather than sharing global
+state, which also makes it safe to use from parallel tests.
 
 All six `BEFORE`/`AFTER` × `INSERT`/`UPDATE`/`DELETE` combinations are
 supported. `Set()`/`SetColumns()` assign `NEW` columns and work on any
@@ -137,7 +139,7 @@ v := view.New("active_users").
         return tx.Model(&User{}).Where("active = ?", true)
     })
 
-if err := dbobjects.Register(context.Background(), v); err != nil {
+if err := client.Register(context.Background(), v); err != nil {
     log.Fatal(err)
 }
 ```
@@ -202,7 +204,7 @@ Atlas parses the DDL itself and computes its own diff — conditional SQL
 just gets in its way:
 
 ```go
-stmts, _ := dbobjects.Render([]dbobjects.DBObject{tr}, dbobjects.Declarative)
+stmts, _ := client.Render([]dbobjects.DBObject{tr}, dbobjects.Declarative)
 ```
 
 ## Testing

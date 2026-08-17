@@ -14,14 +14,12 @@ import (
 	"gorm.io/gorm"
 )
 
-func TestRender_WithoutInit(t *testing.T) {
-	// Init(nil) resets dbobjects' package-level DB handle so this test's
-	// outcome doesn't depend on whether another test already called Init.
-	dbobjects.Init(nil)
+func TestRender_NilDB(t *testing.T) {
+	client := dbobjects.NewClient(nil)
 
 	tr := trigger.BeforeUpdate(&testutil.UserMaster{}).Set("updated_at", trigger.Now())
-	if _, err := dbobjects.Render([]dbobjects.DBObject{tr}, dbobjects.Idempotent); err == nil {
-		t.Fatal("Render() error = nil, want error when Init was never called")
+	if _, err := client.Render([]dbobjects.DBObject{tr}, dbobjects.Idempotent); err == nil {
+		t.Fatal("Render() error = nil, want error when the Client has no *gorm.DB")
 	}
 }
 
@@ -42,12 +40,12 @@ func TestRender_Declarative_Postgres_IsValidDDL(t *testing.T) {
 		t.Fatalf("AutoMigrate: %v", err)
 	}
 
-	dbobjects.Init(db)
+	client := dbobjects.NewClient(db)
 	tr := trigger.BeforeUpdate(&testutil.UserMaster{}).
 		Set("updated_at", trigger.Now()).
 		Name("trg_render_declarative_pg_test")
 
-	stmts, err := dbobjects.Render([]dbobjects.DBObject{tr}, dbobjects.Declarative)
+	stmts, err := client.Render([]dbobjects.DBObject{tr}, dbobjects.Declarative)
 	if err != nil {
 		t.Fatalf("Render: %v", err)
 	}
@@ -62,8 +60,8 @@ func TestRender_Declarative_Postgres_IsValidDDL(t *testing.T) {
 	// Declarative output is bare CREATE, not idempotent -- drop first so
 	// this test can re-run against a DB that already has the object from
 	// a previous run.
-	t.Cleanup(func() { _ = dbobjects.Drop(context.Background(), tr) })
-	_ = dbobjects.Drop(context.Background(), tr)
+	t.Cleanup(func() { _ = client.Drop(context.Background(), tr) })
+	_ = client.Drop(context.Background(), tr)
 
 	for _, stmt := range strings.Split(sql, "\n\n") {
 		if err := db.Exec(stmt).Error; err != nil {
@@ -96,12 +94,12 @@ func TestRender_Declarative_MySQL_IsValidDDL(t *testing.T) {
 		t.Fatalf("AutoMigrate: %v", err)
 	}
 
-	dbobjects.Init(db)
+	client := dbobjects.NewClient(db)
 	tr := trigger.BeforeUpdate(&testutil.UserMaster{}).
 		Set("updated_at", trigger.Now()).
 		Name("trg_render_declarative_mysql_test")
 
-	stmts, err := dbobjects.Render([]dbobjects.DBObject{tr}, dbobjects.Declarative)
+	stmts, err := client.Render([]dbobjects.DBObject{tr}, dbobjects.Declarative)
 	if err != nil {
 		t.Fatalf("Render: %v", err)
 	}
@@ -113,8 +111,8 @@ func TestRender_Declarative_MySQL_IsValidDDL(t *testing.T) {
 		t.Errorf("Declarative output should contain neither OR REPLACE nor IF EXISTS, got:\n%s", sql)
 	}
 
-	t.Cleanup(func() { _ = dbobjects.Drop(context.Background(), tr) })
-	_ = dbobjects.Drop(context.Background(), tr)
+	t.Cleanup(func() { _ = client.Drop(context.Background(), tr) })
+	_ = client.Drop(context.Background(), tr)
 
 	for _, stmt := range strings.Split(sql, "\n\n") {
 		if err := db.Exec(stmt).Error; err != nil {
@@ -146,13 +144,13 @@ func TestRender_Declarative_View_Postgres_IsValidDDL(t *testing.T) {
 		t.Fatalf("AutoMigrate: %v", err)
 	}
 
-	dbobjects.Init(db)
+	client := dbobjects.NewClient(db)
 	v := view.New("v_render_declarative_pg_test").
 		Query(func(tx *gorm.DB) *gorm.DB {
 			return tx.Model(&testutil.UserMaster{}).Where("name = ?", "RenderDeclarativeMatch")
 		})
 
-	stmts, err := dbobjects.Render([]dbobjects.DBObject{v}, dbobjects.Declarative)
+	stmts, err := client.Render([]dbobjects.DBObject{v}, dbobjects.Declarative)
 	if err != nil {
 		t.Fatalf("Render: %v", err)
 	}
@@ -163,8 +161,8 @@ func TestRender_Declarative_View_Postgres_IsValidDDL(t *testing.T) {
 		t.Errorf("Declarative view output should not contain OR REPLACE, got:\n%s", stmts[0])
 	}
 
-	t.Cleanup(func() { _ = dbobjects.Drop(context.Background(), v) })
-	_ = dbobjects.Drop(context.Background(), v)
+	t.Cleanup(func() { _ = client.Drop(context.Background(), v) })
+	_ = client.Drop(context.Background(), v)
 
 	if err := db.Exec(stmts[0]).Error; err != nil {
 		t.Fatalf("executing declarative CREATE VIEW failed (not valid DDL): %v", err)
@@ -198,13 +196,13 @@ func TestRender_Declarative_View_MySQL_IsValidDDL(t *testing.T) {
 		t.Fatalf("AutoMigrate: %v", err)
 	}
 
-	dbobjects.Init(db)
+	client := dbobjects.NewClient(db)
 	v := view.New("v_render_declarative_mysql_test").
 		Query(func(tx *gorm.DB) *gorm.DB {
 			return tx.Model(&testutil.UserMaster{}).Where("name = ?", "RenderDeclarativeMatchMySQL")
 		})
 
-	stmts, err := dbobjects.Render([]dbobjects.DBObject{v}, dbobjects.Declarative)
+	stmts, err := client.Render([]dbobjects.DBObject{v}, dbobjects.Declarative)
 	if err != nil {
 		t.Fatalf("Render: %v", err)
 	}
@@ -215,8 +213,8 @@ func TestRender_Declarative_View_MySQL_IsValidDDL(t *testing.T) {
 		t.Errorf("Declarative view output should not contain OR REPLACE, got:\n%s", stmts[0])
 	}
 
-	t.Cleanup(func() { _ = dbobjects.Drop(context.Background(), v) })
-	_ = dbobjects.Drop(context.Background(), v)
+	t.Cleanup(func() { _ = client.Drop(context.Background(), v) })
+	_ = client.Drop(context.Background(), v)
 
 	if err := db.Exec(stmts[0]).Error; err != nil {
 		t.Fatalf("executing declarative CREATE VIEW failed (not valid DDL): %v", err)

@@ -235,16 +235,14 @@ func TestTrigger_Name_DefaultsEmpty(t *testing.T) {
 	}
 }
 
-// --- dbobjects.Register() ---
+// --- client.Register() ---
 
-func TestRegister_WithoutInit(t *testing.T) {
-	// Init(nil) resets dbobjects' package-level DB handle so this test's
-	// outcome doesn't depend on whether another test already called Init.
-	dbobjects.Init(nil)
+func TestRegister_NilDB(t *testing.T) {
+	client := dbobjects.NewClient(nil)
 
 	tr := trigger.BeforeUpdate(&testutil.UserMaster{}).Set("updated_at", trigger.Now())
-	if err := dbobjects.Register(context.Background(), tr); err == nil {
-		t.Fatal("Register() error = nil, want error when Init was never called")
+	if err := client.Register(context.Background(), tr); err == nil {
+		t.Fatal("Register() error = nil, want error when the Client has no *gorm.DB")
 	}
 }
 
@@ -263,9 +261,9 @@ func TestRegister_AppliesTrigger(t *testing.T) {
 		t.Fatalf("AutoMigrate: %v", err)
 	}
 
-	dbobjects.Init(db)
+	client := dbobjects.NewClient(db)
 	tr := trigger.BeforeUpdate(&testutil.UserMaster{}).Set("updated_at", trigger.Now())
-	if err := dbobjects.Register(context.Background(), tr); err != nil {
+	if err := client.Register(context.Background(), tr); err != nil {
 		t.Fatalf("Register: %v", err)
 	}
 
@@ -310,11 +308,11 @@ func TestRegister_AppliesCustomName(t *testing.T) {
 		t.Fatalf("AutoMigrate: %v", err)
 	}
 
-	dbobjects.Init(db)
+	client := dbobjects.NewClient(db)
 	tr := trigger.BeforeUpdate(&testutil.UserMaster{}).
 		Set("updated_at", trigger.Now()).
 		Name("trg_users_touch")
-	if err := dbobjects.Register(context.Background(), tr); err != nil {
+	if err := client.Register(context.Background(), tr); err != nil {
 		t.Fatalf("Register: %v", err)
 	}
 	t.Cleanup(func() {
@@ -362,13 +360,13 @@ func TestRegister_AppliesDeleteTrigger(t *testing.T) {
 	}
 	t.Cleanup(func() { db.Exec("DROP TABLE IF EXISTS user_master_delete_audit") })
 
-	dbobjects.Init(db)
+	client := dbobjects.NewClient(db)
 	tr := trigger.AfterDelete(&testutil.UserMaster{}).
 		Body("INSERT INTO user_master_delete_audit(deleted_user_id) VALUES (OLD.id);")
-	if err := dbobjects.Register(context.Background(), tr); err != nil {
+	if err := client.Register(context.Background(), tr); err != nil {
 		t.Fatalf("Register: %v", err)
 	}
-	t.Cleanup(func() { _ = dbobjects.Drop(context.Background(), tr) })
+	t.Cleanup(func() { _ = client.Drop(context.Background(), tr) })
 
 	user := testutil.UserMaster{Name: "Grace", Email: fmt.Sprintf("grace-%d@example.com", time.Now().UnixNano())}
 	if err := db.Create(&user).Error; err != nil {
@@ -414,13 +412,13 @@ func TestRegister_AppliesAfterInsertTrigger(t *testing.T) {
 	}
 	t.Cleanup(func() { db.Exec("DROP TABLE IF EXISTS user_master_insert_audit") })
 
-	dbobjects.Init(db)
+	client := dbobjects.NewClient(db)
 	tr := trigger.AfterInsert(&testutil.UserMaster{}).
 		Body("INSERT INTO user_master_insert_audit(user_master_id) VALUES (NEW.id);")
-	if err := dbobjects.Register(context.Background(), tr); err != nil {
+	if err := client.Register(context.Background(), tr); err != nil {
 		t.Fatalf("Register: %v", err)
 	}
-	t.Cleanup(func() { _ = dbobjects.Drop(context.Background(), tr) })
+	t.Cleanup(func() { _ = client.Drop(context.Background(), tr) })
 
 	user := testutil.UserMaster{Name: "Alan", Email: fmt.Sprintf("alan-%d@example.com", time.Now().UnixNano())}
 	if err := db.Create(&user).Error; err != nil {
@@ -460,13 +458,13 @@ func TestRegister_AppliesAfterUpdateTrigger(t *testing.T) {
 	}
 	t.Cleanup(func() { db.Exec("DROP TABLE IF EXISTS user_master_update_audit") })
 
-	dbobjects.Init(db)
+	client := dbobjects.NewClient(db)
 	tr := trigger.AfterUpdate(&testutil.UserMaster{}).
 		Body("INSERT INTO user_master_update_audit(user_master_id) VALUES (NEW.id);")
-	if err := dbobjects.Register(context.Background(), tr); err != nil {
+	if err := client.Register(context.Background(), tr); err != nil {
 		t.Fatalf("Register: %v", err)
 	}
-	t.Cleanup(func() { _ = dbobjects.Drop(context.Background(), tr) })
+	t.Cleanup(func() { _ = client.Drop(context.Background(), tr) })
 
 	user := testutil.UserMaster{Name: "Alan", Email: fmt.Sprintf("alan-upd-%d@example.com", time.Now().UnixNano())}
 	if err := db.Create(&user).Error; err != nil {
@@ -504,9 +502,9 @@ func TestRegister_MySQL_AppliesTrigger(t *testing.T) {
 		t.Fatalf("AutoMigrate: %v", err)
 	}
 
-	dbobjects.Init(db)
+	client := dbobjects.NewClient(db)
 	tr := trigger.BeforeUpdate(&testutil.UserMaster{}).Set("updated_at", trigger.Now())
-	if err := dbobjects.Register(context.Background(), tr); err != nil {
+	if err := client.Register(context.Background(), tr); err != nil {
 		t.Fatalf("Register: %v", err)
 	}
 
@@ -559,13 +557,13 @@ func TestRegister_MySQL_AppliesDeleteTrigger(t *testing.T) {
 	}
 	t.Cleanup(func() { db.Exec("DROP TABLE IF EXISTS user_master_delete_audit") })
 
-	dbobjects.Init(db)
+	client := dbobjects.NewClient(db)
 	tr := trigger.AfterDelete(&testutil.UserMaster{}).
 		Body("INSERT INTO user_master_delete_audit(deleted_user_id) VALUES (OLD.id);")
-	if err := dbobjects.Register(context.Background(), tr); err != nil {
+	if err := client.Register(context.Background(), tr); err != nil {
 		t.Fatalf("Register: %v", err)
 	}
-	t.Cleanup(func() { _ = dbobjects.Drop(context.Background(), tr) })
+	t.Cleanup(func() { _ = client.Drop(context.Background(), tr) })
 
 	user := testutil.UserMaster{Name: "Grace", Email: fmt.Sprintf("grace-mysql-%d@example.com", time.Now().UnixNano())}
 	if err := db.Create(&user).Error; err != nil {
@@ -607,13 +605,13 @@ func TestRegister_MySQL_AppliesAfterInsertTrigger(t *testing.T) {
 	}
 	t.Cleanup(func() { db.Exec("DROP TABLE IF EXISTS user_master_insert_audit") })
 
-	dbobjects.Init(db)
+	client := dbobjects.NewClient(db)
 	tr := trigger.AfterInsert(&testutil.UserMaster{}).
 		Body("INSERT INTO user_master_insert_audit(user_master_id) VALUES (NEW.id);")
-	if err := dbobjects.Register(context.Background(), tr); err != nil {
+	if err := client.Register(context.Background(), tr); err != nil {
 		t.Fatalf("Register: %v", err)
 	}
-	t.Cleanup(func() { _ = dbobjects.Drop(context.Background(), tr) })
+	t.Cleanup(func() { _ = client.Drop(context.Background(), tr) })
 
 	user := testutil.UserMaster{Name: "Alan", Email: fmt.Sprintf("alan-mysql-%d@example.com", time.Now().UnixNano())}
 	if err := db.Create(&user).Error; err != nil {
@@ -653,13 +651,13 @@ func TestRegister_MySQL_AppliesAfterUpdateTrigger(t *testing.T) {
 	}
 	t.Cleanup(func() { db.Exec("DROP TABLE IF EXISTS user_master_update_audit") })
 
-	dbobjects.Init(db)
+	client := dbobjects.NewClient(db)
 	tr := trigger.AfterUpdate(&testutil.UserMaster{}).
 		Body("INSERT INTO user_master_update_audit(user_master_id) VALUES (NEW.id);")
-	if err := dbobjects.Register(context.Background(), tr); err != nil {
+	if err := client.Register(context.Background(), tr); err != nil {
 		t.Fatalf("Register: %v", err)
 	}
-	t.Cleanup(func() { _ = dbobjects.Drop(context.Background(), tr) })
+	t.Cleanup(func() { _ = client.Drop(context.Background(), tr) })
 
 	user := testutil.UserMaster{Name: "Alan", Email: fmt.Sprintf("alan-mysql-upd-%d@example.com", time.Now().UnixNano())}
 	if err := db.Create(&user).Error; err != nil {
@@ -702,7 +700,7 @@ func TestRegister_MySQL_CompensatesOnFailure(t *testing.T) {
 		t.Fatalf("AutoMigrate: %v", err)
 	}
 
-	dbobjects.Init(db)
+	client := dbobjects.NewClient(db)
 
 	good := trigger.BeforeUpdate(&testutil.UserMaster{}).
 		Set("updated_at", trigger.Now()).
@@ -716,7 +714,7 @@ func TestRegister_MySQL_CompensatesOnFailure(t *testing.T) {
 		db.Exec("DROP TRIGGER IF EXISTS trg_compensation_bad")
 	})
 
-	if err := dbobjects.Register(context.Background(), good, bad); err == nil {
+	if err := client.Register(context.Background(), good, bad); err == nil {
 		t.Fatal("Register() error = nil, want error from the intentionally invalid second trigger")
 	}
 

@@ -25,22 +25,23 @@ type DBObject interface {
 	Kind() string
 }
 
-var db *gorm.DB
-
-// Init registers the *gorm.DB that Register applies trigger DDL against.
-func Init(conn *gorm.DB) {
-	db = conn
+type Client struct {
+	db *gorm.DB
 }
 
-// resolveDialect returns the dialect configured via Init, or an error
-// naming op ("Register"/"Drop"/"Render") for a clearer message.
-func resolveDialect(op string) (dialect, error) {
-	if db == nil {
-		return nil, fmt.Errorf("dbobjects: Init must be called before %s", op)
+func NewClient(conn *gorm.DB) *Client {
+	return &Client{db: conn}
+}
+
+// resolveDialect returns the dialect for the Client's configured DB, or
+// an error naming op ("Register"/"Drop"/"Render") for a clearer message.
+func (c *Client) resolveDialect(op string) (dialect, error) {
+	if c.db == nil {
+		return nil, fmt.Errorf("dbobjects: Client has no *gorm.DB set; construct one via NewClient before calling %s", op)
 	}
-	d, ok := dialectFor(db.Name())
+	d, ok := dialectFor(c.db.Name())
 	if !ok {
-		return nil, fmt.Errorf("dbobjects: unsupported dialect %q", db.Name())
+		return nil, fmt.Errorf("dbobjects: unsupported dialect %q", c.db.Name())
 	}
 	return d, nil
 }
@@ -63,7 +64,7 @@ const (
 // formats desc from whatever fields its concrete Definition actually
 // has (trigger has Table; a future procedure has no table at all), so
 // nothing forces a field across kinds that don't share one.
-func resolveDDL(d dialect, obj DBObject, op ddlOp) (stmts []string, desc, name string, err error) {
+func (c *Client) resolveDDL(d dialect, obj DBObject, op ddlOp) (stmts []string, desc, name string, err error) {
 	switch o := obj.(type) {
 	case trigger.Trigger:
 		def, err := o.Build()
@@ -99,9 +100,9 @@ func resolveDDL(d dialect, obj DBObject, op ddlOp) (stmts []string, desc, name s
 		case opDrop:
 			stmts, err = vd.dropView(def)
 		case opRenderDeclarative:
-			stmts, err = vd.renderViewDeclarative(db, def)
+			stmts, err = vd.renderViewDeclarative(c.db, def)
 		default:
-			stmts, err = vd.renderView(db, def)
+			stmts, err = vd.renderView(c.db, def)
 		}
 		return stmts, desc, def.Name, err
 	default:
@@ -124,14 +125,14 @@ type resolved struct {
 // Never stops early -- one object's compensation failing doesn't
 // predict whether the others will too. Returns one error per object
 // whose compensation itself failed.
-func compensate(ctx context.Context, applied []resolved) []error {
+func (c *Client) compensate(ctx context.Context, applied []resolved) []error {
 	cleanupCtx, cancel := context.WithTimeout(context.WithoutCancel(ctx), compensationTimeout)
 	defer cancel()
 
 	var errs []error
 	for _, r := range slices.Backward(applied) {
 		for _, stmt := range r.dropStmts {
-			if err := db.WithContext(cleanupCtx).Exec(stmt).Error; err != nil {
+			if err := c.db.WithContext(cleanupCtx).Exec(stmt).Error; err != nil {
 				errs = append(errs, fmt.Errorf("compensating %s: %w", r.desc, err))
 				break // this object's cleanup failed; move to the next one
 			}
@@ -141,17 +142,17 @@ func compensate(ctx context.Context, applied []resolved) []error {
 }
 
 // Register builds each object's definition and executes the resulting
-// DDL against the DB configured via Init, using the dialect that matches
-// that DB's driver (see dialect.go).
-func Register(ctx context.Context, objects ...DBObject) error {
-	d,err := resolveDialect("Register")
+// DDL against the Client's DB, using the dialect that matches that DB's
+// driver (see dialect.go).
+func (c *Client) Register(ctx context.Context, objects ...DBObject) error {
+	d,err := c.resolveDialect("Register")
 	if err != nil {
 		return err
 	}
 	results:=make([]resolved, len(objects))
 	seen:=make(map[string]int, len(objects))
 	for i, obj := range objects {
-		stmts, desc, name, err := resolveDDL(d, obj, opRender)
+		stmts, desc, name, err := c.resolveDDL(d, obj, opRender)
 		if err != nil {
 			return err
 		}
@@ -160,7 +161,7 @@ func Register(ctx context.Context, objects ...DBObject) error {
 		}
 		seen[name] = i
 
-		dropStmts, _, _, err := resolveDDL(d, obj, opDrop)
+		dropStmts, _, _, err := c.resolveDDL(d, obj, opDrop)
 		if err != nil {
 			return err
 		}
@@ -174,7 +175,7 @@ func Register(ctx context.Context, objects ...DBObject) error {
 	// that implicitly commit DDL (MySQL, Oracle), this wrapper can't
 	// undo a statement that's already forced its own commit.
 	if d.transactional() {
-		return db.WithContext(ctx).Transaction(func(tx *gorm.DB) error {
+		return c.db.WithContext(ctx).Transaction(func(tx *gorm.DB) error {
 			for _, r := range results {
 				for _, stmt := range r.stmts {
 					if err := tx.Exec(stmt).Error; err != nil {
@@ -188,9 +189,9 @@ func Register(ctx context.Context, objects ...DBObject) error {
 
 	for i, r := range results {
 		for _, stmt := range r.stmts {
-			if err := db.WithContext(ctx).Exec(stmt).Error; err != nil {
+			if err := c.db.WithContext(ctx).Exec(stmt).Error; err != nil {
 				applyErr := fmt.Errorf("dbobjects: applying %s: %w", r.desc, err)
-				compErrs := compensate(ctx, results[:i+1])
+				compErrs := c.compensate(ctx, results[:i+1])
 				if len(compErrs) == 0 {
 					return applyErr
 				}
@@ -204,21 +205,21 @@ func Register(ctx context.Context, objects ...DBObject) error {
 
 
 // Drop removes each object's corresponding DB-side definition (trigger,
-// and later view/procedure) from the DB configured via Init. Safe to
+// and later view/procedure) from the Client's DB. Safe to
 // call for objects that were never registered -- dialect DropTrigger
 // implementations use DROP ... IF EXISTS.
-func Drop(ctx context.Context, objects ...DBObject) error {
-	d, err := resolveDialect("Drop")
+func (c *Client) Drop(ctx context.Context, objects ...DBObject) error {
+	d, err := c.resolveDialect("Drop")
 	if err != nil {
 		return err
 	}
 	for _, obj := range objects {
-		stmts, desc, _, err := resolveDDL(d, obj, opDrop)
+		stmts, desc, _, err := c.resolveDDL(d, obj, opDrop)
 		if err != nil {
 			return err
 		}
 		for _, stmt := range stmts {
-			if err := db.WithContext(ctx).Exec(stmt).Error; err != nil {
+			if err := c.db.WithContext(ctx).Exec(stmt).Error; err != nil {
 				return fmt.Errorf("dbobjects: dropping %s: %w", desc, err)
 			}
 		}
@@ -246,8 +247,8 @@ const (
 )
 
 // Render returns the DDL for each object without executing it.
-func Render(objects []DBObject, mode RenderMode) ([]string, error) {
-	d, err := resolveDialect("Render")
+func (c *Client) Render(objects []DBObject, mode RenderMode) ([]string, error) {
+	d, err := c.resolveDialect("Render")
 	if err != nil {
 		return nil, err
 	}
@@ -259,7 +260,7 @@ func Render(objects []DBObject, mode RenderMode) ([]string, error) {
 
 	out := make([]string, 0, len(objects))
 	for _, obj := range objects {
-		stmts, _,_, err := resolveDDL(d, obj, op)
+		stmts, _,_, err := c.resolveDDL(d, obj, op)
 		if err != nil {
 			return nil, err
 		}

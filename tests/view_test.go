@@ -30,18 +30,18 @@ func TestRegister_AppliesView(t *testing.T) {
 		t.Fatalf("AutoMigrate: %v", err)
 	}
 
-	dbobjects.Init(db)
+	client := dbobjects.NewClient(db)
 
 	v := view.New("v_test_active_users").
 		Query(func(tx *gorm.DB) *gorm.DB {
 			return tx.Model(&testutil.UserMaster{}).Where("name = ?", "ViewTestMatch")
 		})
 
-	if err := dbobjects.Register(context.Background(), v); err != nil {
+	if err := client.Register(context.Background(), v); err != nil {
 		t.Fatalf("Register: %v", err)
 	}
 	t.Cleanup(func() {
-		_ = dbobjects.Drop(context.Background(), v)
+		_ = client.Drop(context.Background(), v)
 	})
 
 	match := testutil.UserMaster{Name: "ViewTestMatch", Email: fmt.Sprintf("match-%d@example.com", time.Now().UnixNano())}
@@ -82,18 +82,18 @@ func TestRegister_MySQL_AppliesView(t *testing.T) {
 		t.Fatalf("AutoMigrate: %v", err)
 	}
 
-	dbobjects.Init(db)
+	client := dbobjects.NewClient(db)
 
 	v := view.New("v_test_active_users_mysql").
 		Query(func(tx *gorm.DB) *gorm.DB {
 			return tx.Model(&testutil.UserMaster{}).Where("name = ?", "ViewTestMatchMySQL")
 		})
 
-	if err := dbobjects.Register(context.Background(), v); err != nil {
+	if err := client.Register(context.Background(), v); err != nil {
 		t.Fatalf("Register: %v", err)
 	}
 	t.Cleanup(func() {
-		_ = dbobjects.Drop(context.Background(), v)
+		_ = client.Drop(context.Background(), v)
 	})
 
 	match := testutil.UserMaster{Name: "ViewTestMatchMySQL", Email: fmt.Sprintf("match-mysql-%d@example.com", time.Now().UnixNano())}
