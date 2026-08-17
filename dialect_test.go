@@ -575,3 +575,252 @@ func TestRenderViewDeclarative_SharedAcrossDialects(t *testing.T) {
 			pgStmts, myStmts)
 	}
 }
+
+// SQLite trigger bodies can't assign to NEW/OLD on any timing (not just
+// AFTER like Postgres/MySQL), so Set()-based triggers always render as
+// AFTER with a rowid-targeted follow-up UPDATE, regardless of the
+// caller's declared Timing. These tests guard that translation, the
+// rowid-not-PrimaryKey targeting, and the WHEN-clause recursion guard
+// (SQLite trigger bodies have no IF/procedural control flow at all, so
+// the guard can't be inline the way Postgres's/MySQL's are).
+
+func TestSQLiteDialect_RenderExpr(t *testing.T) {
+	d := sqliteDialect{}
+	tests := []struct {
+		name string
+		expr trigger.Expr
+		want string
+	}{
+		{"Now", trigger.Now(), "CURRENT_TIMESTAMP"},
+		{"Raw", trigger.Raw("version + 1"), "version + 1"},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			if got := d.renderExpr(tt.expr); got != tt.want {
+				t.Errorf("renderExpr(%+v) = %q, want %q", tt.expr, got, tt.want)
+			}
+		})
+	}
+}
+
+func TestSQLiteDialect_RenderTrigger_BeforeUpdateSet_RendersAsAfter(t *testing.T) {
+	def := &trigger.Definition{
+		Table:  "accounts",
+		Timing: "BEFORE",
+		Event:  "UPDATE",
+		Sets:   map[string]trigger.Expr{"status": trigger.Raw("'synced'")},
+	}
+
+	stmts, err := sqliteDialect{}.renderTrigger(def)
+	if err != nil {
+		t.Fatalf("renderTrigger() error = %v", err)
+	}
+	sql := strings.Join(stmts, "\n")
+	if !strings.Contains(sql, "AFTER UPDATE") {
+		t.Errorf("renderTrigger() output missing \"AFTER UPDATE\", got:\n%s", sql)
+	}
+	if strings.Contains(sql, "BEFORE UPDATE") {
+		t.Errorf("renderTrigger() should not contain a literal BEFORE UPDATE, got:\n%s", sql)
+	}
+}
+
+func TestSQLiteDialect_RenderTrigger_BodyKeepsDeclaredTiming(t *testing.T) {
+	def := &trigger.Definition{
+		Table:  "accounts",
+		Timing: "BEFORE",
+		Event:  "UPDATE",
+		Body:   "SELECT RAISE(ABORT, 'bad status') WHERE NEW.status = 'invalid';",
+	}
+
+	stmts, err := sqliteDialect{}.renderTrigger(def)
+	if err != nil {
+		t.Fatalf("renderTrigger() error = %v", err)
+	}
+	sql := strings.Join(stmts, "\n")
+	if !strings.Contains(sql, "BEFORE UPDATE") {
+		t.Errorf("renderTrigger() with Body() should keep the declared BEFORE timing, got:\n%s", sql)
+	}
+}
+
+func TestSQLiteDialect_RenderTrigger_UsesRowidNotPrimaryKey(t *testing.T) {
+	def := &trigger.Definition{
+		Table:      "accounts",
+		Timing:     "BEFORE",
+		Event:      "UPDATE",
+		Sets:       map[string]trigger.Expr{"status": trigger.Raw("'synced'")},
+		PrimaryKey: "id", // set to prove it's ignored, not just absent
+	}
+
+	stmts, err := sqliteDialect{}.renderTrigger(def)
+	if err != nil {
+		t.Fatalf("renderTrigger() error = %v", err)
+	}
+	sql := strings.Join(stmts, "\n")
+	if want := "WHERE rowid = NEW.rowid;"; !strings.Contains(sql, want) {
+		t.Errorf("renderTrigger() output missing %q, got:\n%s", want, sql)
+	}
+	if strings.Contains(sql, "WHERE id =") {
+		t.Errorf("renderTrigger() should never target Definition.PrimaryKey on SQLite, got:\n%s", sql)
+	}
+}
+
+func TestSQLiteDialect_RenderTrigger_AfterUpdateSet_HasGuard(t *testing.T) {
+	def := &trigger.Definition{
+		Table:  "accounts",
+		Timing: "AFTER",
+		Event:  "UPDATE",
+		Sets:   map[string]trigger.Expr{"status": trigger.Raw("'synced'")},
+	}
+
+	stmts, err := sqliteDialect{}.renderTrigger(def)
+	if err != nil {
+		t.Fatalf("renderTrigger() error = %v", err)
+	}
+	sql := strings.Join(stmts, "\n")
+	for _, want := range []string{
+		"CREATE TABLE IF NOT EXISTS dbobjects_guard (name TEXT PRIMARY KEY);",
+		"WHEN NOT EXISTS (SELECT 1 FROM dbobjects_guard WHERE name = 'trg_accounts_after_update')",
+		"INSERT INTO dbobjects_guard(name) VALUES ('trg_accounts_after_update');",
+		"DELETE FROM dbobjects_guard WHERE name = 'trg_accounts_after_update';",
+	} {
+		if !strings.Contains(sql, want) {
+			t.Errorf("renderTrigger() output missing %q, got:\n%s", want, sql)
+		}
+	}
+}
+
+func TestSQLiteDialect_RenderTrigger_AfterInsertSet_NoGuard(t *testing.T) {
+	def := &trigger.Definition{
+		Table:  "accounts",
+		Timing: "AFTER",
+		Event:  "INSERT",
+		Sets:   map[string]trigger.Expr{"status": trigger.Raw("'new'")},
+	}
+
+	stmts, err := sqliteDialect{}.renderTrigger(def)
+	if err != nil {
+		t.Fatalf("renderTrigger() error = %v", err)
+	}
+	sql := strings.Join(stmts, "\n")
+	if strings.Contains(sql, "dbobjects_guard") {
+		t.Errorf("renderTrigger() should not need a recursion guard on AFTER INSERT, got:\n%s", sql)
+	}
+	if want := "WHERE rowid = NEW.rowid;"; !strings.Contains(sql, want) {
+		t.Errorf("renderTrigger() output missing %q, got:\n%s", want, sql)
+	}
+}
+
+func TestSQLiteDialect_RenderTriggerDeclarative_BodyMatchesIdempotent(t *testing.T) {
+	def := &trigger.Definition{
+		Table:  "accounts",
+		Timing: "AFTER",
+		Event:  "UPDATE",
+		Sets:   map[string]trigger.Expr{"status": trigger.Raw("'synced'")},
+	}
+
+	idempotent, err := sqliteDialect{}.renderTrigger(def)
+	if err != nil {
+		t.Fatalf("renderTrigger() error = %v", err)
+	}
+	declarative, err := sqliteDialect{}.renderTriggerDeclarative(def)
+	if err != nil {
+		t.Fatalf("renderTriggerDeclarative() error = %v", err)
+	}
+
+	idempotentSQL := strings.Join(idempotent, "\n")
+	declarativeSQL := strings.Join(declarative, "\n")
+	if strings.Contains(declarativeSQL, "DROP") {
+		t.Errorf("renderTriggerDeclarative() output should not contain DROP, got:\n%s", declarativeSQL)
+	}
+	for _, want := range []string{
+		"WHEN NOT EXISTS (SELECT 1 FROM dbobjects_guard WHERE name = 'trg_accounts_after_update')",
+		"WHERE rowid = NEW.rowid;",
+	} {
+		if !strings.Contains(idempotentSQL, want) {
+			t.Fatalf("test setup: idempotent output missing %q, got:\n%s", want, idempotentSQL)
+		}
+		if !strings.Contains(declarativeSQL, want) {
+			t.Errorf("renderTriggerDeclarative() body diverged from renderTrigger(): missing %q, got:\n%s", want, declarativeSQL)
+		}
+	}
+}
+
+func TestSQLiteDialect_DropTrigger_DoesNotTouchGuardTable(t *testing.T) {
+	def := &trigger.Definition{
+		Table:  "accounts",
+		Timing: "AFTER",
+		Event:  "UPDATE",
+		Sets:   map[string]trigger.Expr{"status": trigger.Raw("'synced'")},
+	}
+
+	stmts, err := sqliteDialect{}.dropTrigger(def)
+	if err != nil {
+		t.Fatalf("dropTrigger() error = %v", err)
+	}
+	if len(stmts) != 1 {
+		t.Fatalf("dropTrigger() returned %d statement(s), want 1", len(stmts))
+	}
+	if strings.Contains(stmts[0], "dbobjects_guard") {
+		t.Errorf("dropTrigger() should never reference dbobjects_guard, got:\n%s", stmts[0])
+	}
+	if want := "DROP TRIGGER IF EXISTS trg_accounts_after_update;"; stmts[0] != want {
+		t.Errorf("dropTrigger()[0] = %q, want %q", stmts[0], want)
+	}
+}
+
+func TestSQLiteDialect_RenderView_ComposesDropAndCreate(t *testing.T) {
+	def := &view.Definition{
+		Name:   "active_users",
+		RawSQL: "SELECT * FROM user_master WHERE deleted_at IS NULL",
+	}
+
+	got, err := sqliteDialect{}.renderView(nil, def)
+	if err != nil {
+		t.Fatalf("renderView() error = %v", err)
+	}
+
+	drop, _ := dropViewIfExists(def)
+	create, err := renderViewCreate(nil, def)
+	if err != nil {
+		t.Fatalf("renderViewCreate() error = %v", err)
+	}
+	want := append(drop, create...)
+
+	if strings.Join(got, "\n") != strings.Join(want, "\n") {
+		t.Errorf("renderView() = %v, want %v (drop+create composition)", got, want)
+	}
+}
+
+func TestSQLiteDialect_RenderViewDeclarative_Raw(t *testing.T) {
+	def := &view.Definition{
+		Name:   "active_users",
+		RawSQL: "SELECT * FROM user_master WHERE deleted_at IS NULL",
+	}
+
+	stmts, err := sqliteDialect{}.renderViewDeclarative(nil, def)
+	if err != nil {
+		t.Fatalf("renderViewDeclarative() error = %v", err)
+	}
+	if len(stmts) != 1 {
+		t.Fatalf("renderViewDeclarative() returned %d statement(s), want 1:\n%s", len(stmts), strings.Join(stmts, "\n---\n"))
+	}
+	want := `CREATE VIEW active_users AS SELECT * FROM user_master WHERE deleted_at IS NULL`
+	if stmts[0] != want {
+		t.Errorf("renderViewDeclarative()[0] = %q, want %q", stmts[0], want)
+	}
+}
+
+func TestSQLiteDialect_DropView(t *testing.T) {
+	def := &view.Definition{Name: "active_users"}
+
+	stmts, err := sqliteDialect{}.dropView(def)
+	if err != nil {
+		t.Fatalf("dropView() error = %v", err)
+	}
+	if len(stmts) != 1 {
+		t.Fatalf("dropView() returned %d statement(s), want 1:\n%s", len(stmts), strings.Join(stmts, "\n---\n"))
+	}
+	if want := "DROP VIEW IF EXISTS active_users;"; stmts[0] != want {
+		t.Errorf("dropView()[0] = %q, want %q", stmts[0], want)
+	}
+}

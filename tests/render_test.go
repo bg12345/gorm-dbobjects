@@ -18,7 +18,7 @@ func TestRender_NilDB(t *testing.T) {
 	client := dbobjects.NewClient(nil)
 
 	tr := trigger.BeforeUpdate(&testutil.UserMaster{}).Set("updated_at", trigger.Now())
-	if _, err := client.Render([]dbobjects.DBObject{tr}, dbobjects.Idempotent); err == nil {
+	if _, err := client.Render(dbobjects.Idempotent, tr); err == nil {
 		t.Fatal("Render() error = nil, want error when the Client has no *gorm.DB")
 	}
 }
@@ -45,7 +45,7 @@ func TestRender_Declarative_Postgres_IsValidDDL(t *testing.T) {
 		Set("updated_at", trigger.Now()).
 		Name("trg_render_declarative_pg_test")
 
-	stmts, err := client.Render([]dbobjects.DBObject{tr}, dbobjects.Declarative)
+	stmts, err := client.Render(dbobjects.Declarative, tr)
 	if err != nil {
 		t.Fatalf("Render: %v", err)
 	}
@@ -99,7 +99,7 @@ func TestRender_Declarative_MySQL_IsValidDDL(t *testing.T) {
 		Set("updated_at", trigger.Now()).
 		Name("trg_render_declarative_mysql_test")
 
-	stmts, err := client.Render([]dbobjects.DBObject{tr}, dbobjects.Declarative)
+	stmts, err := client.Render(dbobjects.Declarative, tr)
 	if err != nil {
 		t.Fatalf("Render: %v", err)
 	}
@@ -150,7 +150,7 @@ func TestRender_Declarative_View_Postgres_IsValidDDL(t *testing.T) {
 			return tx.Model(&testutil.UserMaster{}).Where("name = ?", "RenderDeclarativeMatch")
 		})
 
-	stmts, err := client.Render([]dbobjects.DBObject{v}, dbobjects.Declarative)
+	stmts, err := client.Render(dbobjects.Declarative, v)
 	if err != nil {
 		t.Fatalf("Render: %v", err)
 	}
@@ -202,7 +202,7 @@ func TestRender_Declarative_View_MySQL_IsValidDDL(t *testing.T) {
 			return tx.Model(&testutil.UserMaster{}).Where("name = ?", "RenderDeclarativeMatchMySQL")
 		})
 
-	stmts, err := client.Render([]dbobjects.DBObject{v}, dbobjects.Declarative)
+	stmts, err := client.Render(dbobjects.Declarative, v)
 	if err != nil {
 		t.Fatalf("Render: %v", err)
 	}
@@ -228,6 +228,99 @@ func TestRender_Declarative_View_MySQL_IsValidDDL(t *testing.T) {
 
 	var rows []testutil.UserMaster
 	if err := db.Table("v_render_declarative_mysql_test").Find(&rows).Error; err != nil {
+		t.Fatalf("querying view: %v", err)
+	}
+	if len(rows) != 1 {
+		t.Fatalf("view returned %d row(s), want 1: %+v", len(rows), rows)
+	}
+}
+
+// TestRender_Declarative_SQLite_IsValidDDL is the SQLite equivalent of
+// TestRender_Declarative_Postgres_IsValidDDL. SQLite has no external
+// service to be unreachable, so this never self-skips.
+func TestRender_Declarative_SQLite_IsValidDDL(t *testing.T) {
+	db, err := testutil.NewSQLite(newSQLiteDSN(t))
+	if err != nil {
+		t.Skipf("skipping integration test, no SQLite available: %v", err)
+	}
+
+	if err := db.AutoMigrate(&testutil.UserMaster{}); err != nil {
+		t.Fatalf("AutoMigrate: %v", err)
+	}
+
+	client := dbobjects.NewClient(db)
+	tr := trigger.BeforeUpdate(&testutil.UserMaster{}).
+		Set("updated_at", trigger.Now()).
+		Name("trg_render_declarative_sqlite_test")
+
+	stmts, err := client.Render(dbobjects.Declarative, tr)
+	if err != nil {
+		t.Fatalf("Render: %v", err)
+	}
+	if len(stmts) != 1 {
+		t.Fatalf("Render() returned %d object(s), want 1", len(stmts))
+	}
+	sql := stmts[0]
+	if strings.Contains(sql, "OR REPLACE") || strings.Contains(sql, "DROP TRIGGER") {
+		t.Errorf("Declarative output should contain neither OR REPLACE nor a DROP TRIGGER, got:\n%s", sql)
+	}
+
+	for _, stmt := range strings.Split(sql, "\n\n") {
+		if err := db.Exec(stmt).Error; err != nil {
+			t.Fatalf("executing declarative statement failed (not valid DDL):\n%s\nerror: %v", stmt, err)
+		}
+	}
+
+	var trgCount int64
+	if err := db.Raw(`SELECT count(*) FROM sqlite_master WHERE type = 'trigger' AND name = ?`,
+		"trg_render_declarative_sqlite_test").Scan(&trgCount).Error; err != nil {
+		t.Fatalf("querying sqlite_master: %v", err)
+	}
+	if trgCount != 1 {
+		t.Errorf("sqlite_master trigger rows named trg_render_declarative_sqlite_test = %d, want 1 (declarative DDL should have created it)", trgCount)
+	}
+}
+
+// TestRender_Declarative_View_SQLite_IsValidDDL is the SQLite
+// equivalent of TestRender_Declarative_View_Postgres_IsValidDDL.
+func TestRender_Declarative_View_SQLite_IsValidDDL(t *testing.T) {
+	db, err := testutil.NewSQLite(newSQLiteDSN(t))
+	if err != nil {
+		t.Skipf("skipping integration test, no SQLite available: %v", err)
+	}
+
+	if err := db.AutoMigrate(&testutil.UserMaster{}); err != nil {
+		t.Fatalf("AutoMigrate: %v", err)
+	}
+
+	client := dbobjects.NewClient(db)
+	v := view.New("v_render_declarative_sqlite_test").
+		Query(func(tx *gorm.DB) *gorm.DB {
+			return tx.Model(&testutil.UserMaster{}).Where("name = ?", "RenderDeclarativeMatchSQLite")
+		})
+
+	stmts, err := client.Render(dbobjects.Declarative, v)
+	if err != nil {
+		t.Fatalf("Render: %v", err)
+	}
+	if len(stmts) != 1 {
+		t.Fatalf("Render() returned %d object(s), want 1", len(stmts))
+	}
+	if strings.Contains(stmts[0], "OR REPLACE") {
+		t.Errorf("Declarative view output should not contain OR REPLACE, got:\n%s", stmts[0])
+	}
+
+	if err := db.Exec(stmts[0]).Error; err != nil {
+		t.Fatalf("executing declarative CREATE VIEW failed (not valid DDL): %v", err)
+	}
+
+	match := testutil.UserMaster{Name: "RenderDeclarativeMatchSQLite", Email: fmt.Sprintf("rd-match-sqlite-%d@example.com", time.Now().UnixNano())}
+	if err := db.Create(&match).Error; err != nil {
+		t.Fatalf("Create: %v", err)
+	}
+
+	var rows []testutil.UserMaster
+	if err := db.Table("v_render_declarative_sqlite_test").Find(&rows).Error; err != nil {
 		t.Fatalf("querying view: %v", err)
 	}
 	if len(rows) != 1 {

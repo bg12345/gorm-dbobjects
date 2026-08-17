@@ -10,6 +10,7 @@ import (
 	"gorm.io/gorm"
 	"github.com/joho/godotenv"
 	"gorm.io/driver/mysql"
+	"gorm.io/driver/sqlite"
 )
 
 // loadEnv loads the repo-root .env regardless of the calling test
@@ -56,4 +57,13 @@ func NewMySQL() (*gorm.DB,error){
 		os.Getenv("MYSQL_USER"),os.Getenv("MYSQL_PASSWORD"),os.Getenv("MYSQL_HOST"),os.Getenv("MYSQL_PORT"),os.Getenv("MYSQL_DB"))
 	
 	return gorm.Open(mysql.Open(dsn), &gorm.Config{})
+}
+
+// NewSQLite opens a SQLite *gorm.DB at dsn. Unlike NewPostgres/NewMySQL,
+// dsn is a parameter rather than read from .env -- SQLite needs no
+// external service to configure, and callers own their own file
+// lifecycle (typically a fresh t.TempDir() path per test) rather than
+// sharing one configured connection target.
+func NewSQLite(dsn string) (*gorm.DB, error) {
+	return gorm.Open(sqlite.Open(dsn), &gorm.Config{})
 }

@@ -31,6 +31,7 @@ type dialect interface {
 var dialects = map[string]dialect{
 	"postgres": postgresDialect{},
 	"mysql":    mysqlDialect{},
+	"sqlite":   sqliteDialect{},
 }
 
 func dialectFor(name string) (dialect, bool) {
@@ -58,6 +59,17 @@ func (mysqlDialect) transactional() bool {
 	return false
 }
 
+type sqliteDialect struct{}
+
+func (sqliteDialect) Name() string {
+	return "sqlite"
+}
+
+func (sqliteDialect) transactional() bool {
+	return true
+}
+
+
 // renderExpr resolves e to this dialect's SQL spelling. Postgres and
 // MySQL both happen to spell "current timestamp" as NOW(); other
 // engines will need their own version of this method once those
@@ -75,6 +87,15 @@ func (mysqlDialect) renderExpr(e trigger.Expr) string {
 	switch e.Kind {
 	case trigger.ExprNow:
 		return "NOW()"
+	default:
+		return e.Raw
+	}
+}
+
+func (sqliteDialect) renderExpr(e trigger.Expr) string {
+	switch e.Kind {
+	case trigger.ExprNow:
+		return "CURRENT_TIMESTAMP"
 	default:
 		return e.Raw
 	}
@@ -300,6 +321,128 @@ func (d mysqlDialect) dropTrigger(def *trigger.Definition) ([]string, error) {
 	}, nil
 }
 
+// triggerBody renders the BEGIN...END body for def's trigger and the
+// WHEN clause it needs, if any. SQLite trigger bodies have no
+// procedural control flow at all (no IF, no exception handler) -- WHEN
+// is the only conditional gate SQLite has, evaluated once before the
+// body runs, so any recursion guard has to live there rather than
+// inline in the body the way Postgres's pg_trigger_depth() check or
+// MySQL's IF do. Set()-based bodies always target the row via rowid,
+// never Definition.PrimaryKey -- rowid is implicitly present on every
+// ordinary table and, since the caller-facing timing is always coerced
+// to AFTER for the Set() path (the row's guaranteed to already exist by
+// then), NEW.rowid is always well-defined; a table declared WITHOUT
+// ROWID has none, and that surfaces as a real "no such column: rowid"
+// error the first time such a trigger fires, not something this layer
+// can pre-validate.
+func (d sqliteDialect) triggerBody(def *trigger.Definition, trgName string) (body, when string) {
+	if def.Body != "" {
+		return fmt.Sprintf("  %s\n", def.Body), ""
+	}
+
+	columns := sortedSetColumns(def.Sets)
+	assigns := make([]string, len(columns))
+	for i, column := range columns {
+		assigns[i] = fmt.Sprintf("%s = %s", column, d.renderExpr(def.Sets[column]))
+	}
+	updateStmt := fmt.Sprintf("UPDATE %s SET %s WHERE rowid = NEW.rowid;",
+		def.Table, strings.Join(assigns, ", "))
+
+	if def.Event != "UPDATE" {
+		// AFTER INSERT can't recurse into itself via this UPDATE (it's
+		// not another INSERT), so no guard is needed.
+		return fmt.Sprintf("  %s\n", updateStmt), ""
+	}
+
+	// This UPDATE re-fires this same AFTER UPDATE trigger. Guarded via a
+	// permanent dbobjects_guard table (created alongside the trigger,
+	// see renderTrigger/renderTriggerDeclarative) rather than a
+	// per-connection TEMP table or PRAGMA, since both of those are
+	// connection-scoped and invisible to a trigger firing on a
+	// different pooled connection than the one that created them.
+	body = fmt.Sprintf("  INSERT INTO dbobjects_guard(name) VALUES ('%s');\n  %s\n  DELETE FROM dbobjects_guard WHERE name = '%s';\n",
+		trgName, updateStmt, trgName)
+	when = fmt.Sprintf("NOT EXISTS (SELECT 1 FROM dbobjects_guard WHERE name = '%s')", trgName)
+	return body, when
+}
+
+// createTriggerStmt renders the CREATE TRIGGER statement itself --
+// shared by renderTrigger and renderTriggerDeclarative. timing is
+// passed in rather than read from def.Timing directly: Set()-based
+// triggers always render as AFTER regardless of what the caller
+// declared (BEFORE INSERT/UPDATE can't work at all on SQLite -- see
+// triggerBody), while Body()-based triggers keep the declared timing
+// verbatim, and the caller (not this helper) is what decides which
+// case applies.
+func (sqliteDialect) createTriggerStmt(def *trigger.Definition, trgName, timing, body, when string) string {
+	var whenClause string
+	if when != "" {
+		whenClause = fmt.Sprintf("\nWHEN %s", when)
+	}
+	return fmt.Sprintf(`CREATE TRIGGER %s %s %s ON %s%s
+BEGIN
+%sEND;`, trgName, timing, def.Event, def.Table, whenClause, body)
+}
+
+// effectiveTriggerTiming returns the timing SQLite DDL should actually
+// use for def. Set()-based triggers always render as AFTER (see
+// triggerBody's doc comment); Body()-based triggers keep def.Timing
+// verbatim, since a literal BEFORE UPDATE ... WHEN ... BEGIN
+// SELECT RAISE(...) END read-only-validation pattern has nothing to do
+// with the NEW-assignment problem Set() has to work around.
+//
+// Known cosmetic-only quirk: the auto-generated trigger name (from the
+// shared triggerNames helper, used by renderTrigger/dropTrigger alike)
+// is still derived from def.Timing, not this function's return value --
+// a Set()-based BeforeUpdate(...) trigger ends up named
+// trg_<table>_before_update while its actual DDL is AFTER UPDATE.
+// Harmless: renderTrigger and dropTrigger both derive the name from
+// def.Timing identically, so they always agree and dropping still
+// targets the right trigger. Not fixed here since it'd mean special-
+// casing the shared triggerNames helper for one dialect's benefit.
+func effectiveTriggerTiming(def *trigger.Definition) string {
+	if def.Body == "" {
+		return "AFTER"
+	}
+	return def.Timing
+}
+
+func (d sqliteDialect) renderTrigger(def *trigger.Definition) ([]string, error) {
+	_, trgName := triggerNames(def)
+	body, when := d.triggerBody(def, trgName)
+
+	stmts := []string{fmt.Sprintf(`DROP TRIGGER IF EXISTS %s;`, trgName)}
+	if when != "" {
+		stmts = append(stmts, `CREATE TABLE IF NOT EXISTS dbobjects_guard (name TEXT PRIMARY KEY);`)
+	}
+	return append(stmts, d.createTriggerStmt(def, trgName, effectiveTriggerTiming(def), body, when)), nil
+}
+
+// renderTriggerDeclarative renders def as bare CREATE statements -- no
+// DROP -- for structural DDL consumers (e.g. an Atlas external schema
+// source). The guard table's CREATE TABLE IF NOT EXISTS is included
+// here too, when needed: a structural-DDL consumer applying this output
+// against a fresh database needs that table to exist, or the emitted
+// WHEN clause references a nonexistent one.
+func (d sqliteDialect) renderTriggerDeclarative(def *trigger.Definition) ([]string, error) {
+	_, trgName := triggerNames(def)
+	body, when := d.triggerBody(def, trgName)
+
+	var stmts []string
+	if when != "" {
+		stmts = append(stmts, `CREATE TABLE IF NOT EXISTS dbobjects_guard (name TEXT PRIMARY KEY);`)
+	}
+	return append(stmts, d.createTriggerStmt(def, trgName, effectiveTriggerTiming(def), body, when)), nil
+}
+
+func (sqliteDialect) dropTrigger(def *trigger.Definition) ([]string, error) {
+	_, trgName := triggerNames(def)
+	// Deliberately never touches dbobjects_guard -- it's shared across
+	// every guarded trigger in the database, so dropping it here would
+	// break every other still-registered guarded trigger.
+	return []string{fmt.Sprintf(`DROP TRIGGER IF EXISTS %s;`, trgName)}, nil
+}
+
 
 // resolveViewBody returns def's view body: RawSQL verbatim if set,
 // otherwise fully-interpolated SQL from QueryFn via db.ToSQL. Shared by
@@ -371,7 +514,31 @@ func (mysqlDialect) dropView(def *view.Definition) ([]string, error) {
 	return dropViewIfExists(def)
 }
 
+// renderView composes SQLite's idempotent view DDL from the two
+// existing shared helpers -- no SQLite-specific rendering logic needed.
+// SQLite has no CREATE OR REPLACE VIEW, so idempotent is DROP VIEW IF
+// EXISTS + bare CREATE VIEW as two statements, the same shape MySQL's
+// trigger rendering already uses.
+func (sqliteDialect) renderView(db *gorm.DB, def *view.Definition) ([]string, error) {
+	drop, _ := dropViewIfExists(def)
+	create, err := renderViewCreate(db, def)
+	if err != nil {
+		return nil, err
+	}
+	return append(drop, create...), nil
+}
+
+func (sqliteDialect) renderViewDeclarative(db *gorm.DB, def *view.Definition) ([]string, error) {
+	return renderViewCreate(db, def)
+}
+
+func (sqliteDialect) dropView(def *view.Definition) ([]string, error) {
+	return dropViewIfExists(def)
+}
+
 var _ triggerDialect = postgresDialect{}
 var _ triggerDialect = mysqlDialect{}
+var _ triggerDialect = sqliteDialect{}
 var _ viewDialect = postgresDialect{}
 var _ viewDialect = mysqlDialect{}
+var _ viewDialect = sqliteDialect{}

@@ -2,6 +2,8 @@ package tests
 
 import (
 	"fmt"
+	"path/filepath"
+	"sync"
 	"testing"
 	"time"
 	"context"
@@ -726,5 +728,369 @@ func TestRegister_MySQL_CompensatesOnFailure(t *testing.T) {
 	if count != 0 {
 		t.Errorf("trg_compensation_good still exists after Register failed on a later object; "+
 			"compensation did not run. count = %d, want 0", count)
+	}
+}
+
+// --- SQLite ---
+//
+// SQLite needs no external service (embedded, file-based), so unlike
+// Postgres/MySQL these tests don't self-skip on an unreachable DB --
+// t.Skipf is kept only for the (should-never-happen) case that opening
+// the CGO-backed driver itself fails.
+
+func newSQLiteDSN(t *testing.T) string {
+	t.Helper()
+	return filepath.Join(t.TempDir(), "test.db") + "?_busy_timeout=5000&_journal_mode=WAL"
+}
+
+// TestRegister_SQLite_AppliesTrigger is an integration test verifying a
+// BeforeUpdate(...).Set(...) trigger fires for real on SQLite, despite
+// being translated to a literal AFTER UPDATE trigger under the hood
+// (see dialect.go's effectiveTriggerTiming) -- the caller-observable
+// behavior (updated_at ends up overridden) must match Postgres/MySQL's
+// BeforeUpdate(...).Set(...) even though the underlying SQL mechanism
+// differs.
+func TestRegister_SQLite_AppliesTrigger(t *testing.T) {
+	db, err := testutil.NewSQLite(newSQLiteDSN(t))
+	if err != nil {
+		t.Skipf("skipping integration test, no SQLite available: %v", err)
+	}
+
+	if err := db.AutoMigrate(&testutil.UserMaster{}); err != nil {
+		t.Fatalf("AutoMigrate: %v", err)
+	}
+
+	client := dbobjects.NewClient(db)
+	tr := trigger.BeforeUpdate(&testutil.UserMaster{}).Set("updated_at", trigger.Now())
+	if err := client.Register(context.Background(), tr); err != nil {
+		t.Fatalf("Register: %v", err)
+	}
+
+	user := testutil.UserMaster{Name: "Ada", Email: fmt.Sprintf("ada-sqlite-%d@example.com", time.Now().UnixNano())}
+	if err := db.Create(&user).Error; err != nil {
+		t.Fatalf("Create: %v", err)
+	}
+
+	old := time.Now().Add(-24 * time.Hour).Truncate(time.Second)
+	if err := db.Model(&user).UpdateColumn("updated_at", old).Error; err != nil {
+		t.Fatalf("UpdateColumn: %v", err)
+	}
+
+	var reloaded testutil.UserMaster
+	if err := db.First(&reloaded, user.ID).Error; err != nil {
+		t.Fatalf("First: %v", err)
+	}
+	if reloaded.UpdatedAt.Equal(old) {
+		t.Fatal("UpdatedAt still equals the value we tried to force; trigger did not fire")
+	}
+	if time.Since(reloaded.UpdatedAt) > 10*time.Second {
+		t.Fatalf("UpdatedAt = %v, want a timestamp close to now (trigger should have set CURRENT_TIMESTAMP)", reloaded.UpdatedAt)
+	}
+}
+
+// TestRegister_SQLite_AppliesDeleteTrigger mirrors the Postgres/MySQL
+// AfterDelete(...).Body(...) coverage.
+func TestRegister_SQLite_AppliesDeleteTrigger(t *testing.T) {
+	db, err := testutil.NewSQLite(newSQLiteDSN(t))
+	if err != nil {
+		t.Skipf("skipping integration test, no SQLite available: %v", err)
+	}
+
+	if err := db.AutoMigrate(&testutil.UserMaster{}); err != nil {
+		t.Fatalf("AutoMigrate: %v", err)
+	}
+	if err := db.Exec(`CREATE TABLE IF NOT EXISTS user_master_delete_audit (
+		id INTEGER PRIMARY KEY AUTOINCREMENT,
+		deleted_user_id INTEGER NOT NULL
+	)`).Error; err != nil {
+		t.Fatalf("creating audit table: %v", err)
+	}
+
+	client := dbobjects.NewClient(db)
+	tr := trigger.AfterDelete(&testutil.UserMaster{}).
+		Body("INSERT INTO user_master_delete_audit(deleted_user_id) VALUES (OLD.id);")
+	if err := client.Register(context.Background(), tr); err != nil {
+		t.Fatalf("Register: %v", err)
+	}
+
+	user := testutil.UserMaster{Name: "Grace", Email: fmt.Sprintf("grace-sqlite-%d@example.com", time.Now().UnixNano())}
+	if err := db.Create(&user).Error; err != nil {
+		t.Fatalf("Create: %v", err)
+	}
+	if err := db.Unscoped().Delete(&user).Error; err != nil {
+		t.Fatalf("Delete: %v", err)
+	}
+
+	var count int64
+	if err := db.Raw(`SELECT count(*) FROM user_master_delete_audit WHERE deleted_user_id = ?`, user.ID).
+		Scan(&count).Error; err != nil {
+		t.Fatalf("querying audit table: %v", err)
+	}
+	if count != 1 {
+		t.Errorf("audit rows for deleted user = %d, want 1 (AFTER DELETE trigger should have fired)", count)
+	}
+}
+
+// TestRegister_SQLite_AppliesAfterInsertTrigger mirrors the Postgres/
+// MySQL AfterInsert(...).Body(...) coverage.
+func TestRegister_SQLite_AppliesAfterInsertTrigger(t *testing.T) {
+	db, err := testutil.NewSQLite(newSQLiteDSN(t))
+	if err != nil {
+		t.Skipf("skipping integration test, no SQLite available: %v", err)
+	}
+
+	if err := db.AutoMigrate(&testutil.UserMaster{}); err != nil {
+		t.Fatalf("AutoMigrate: %v", err)
+	}
+	if err := db.Exec(`CREATE TABLE IF NOT EXISTS user_master_insert_audit (
+		id INTEGER PRIMARY KEY AUTOINCREMENT,
+		user_master_id INTEGER NOT NULL
+	)`).Error; err != nil {
+		t.Fatalf("creating audit table: %v", err)
+	}
+
+	client := dbobjects.NewClient(db)
+	tr := trigger.AfterInsert(&testutil.UserMaster{}).
+		Body("INSERT INTO user_master_insert_audit(user_master_id) VALUES (NEW.id);")
+	if err := client.Register(context.Background(), tr); err != nil {
+		t.Fatalf("Register: %v", err)
+	}
+
+	user := testutil.UserMaster{Name: "Alan", Email: fmt.Sprintf("alan-sqlite-%d@example.com", time.Now().UnixNano())}
+	if err := db.Create(&user).Error; err != nil {
+		t.Fatalf("Create: %v", err)
+	}
+
+	var count int64
+	if err := db.Raw(`SELECT count(*) FROM user_master_insert_audit WHERE user_master_id = ?`, user.ID).
+		Scan(&count).Error; err != nil {
+		t.Fatalf("querying audit table: %v", err)
+	}
+	if count != 1 {
+		t.Errorf("audit rows for inserted user = %d, want 1 (AFTER INSERT trigger should have fired)", count)
+	}
+}
+
+// TestRegister_SQLite_DropTriggerLeavesGuardTableForOthers registers two
+// independently-named, independently-guarded AfterUpdate(...).Set(...)
+// triggers on the same table, drops one, and verifies the other still
+// fires -- guards the decision that dropTrigger never touches the
+// shared dbobjects_guard table (dialect.go).
+func TestRegister_SQLite_DropTriggerLeavesGuardTableForOthers(t *testing.T) {
+	db, err := testutil.NewSQLite(newSQLiteDSN(t))
+	if err != nil {
+		t.Skipf("skipping integration test, no SQLite available: %v", err)
+	}
+
+	if err := db.AutoMigrate(&testutil.UserMaster{}); err != nil {
+		t.Fatalf("AutoMigrate: %v", err)
+	}
+
+	client := dbobjects.NewClient(db)
+	trA := trigger.AfterUpdate(&testutil.UserMaster{}).
+		Set("name", trigger.Raw("'touched-by-a'")).
+		Name("trg_guard_test_a")
+	trB := trigger.AfterUpdate(&testutil.UserMaster{}).
+		Set("email", trigger.Raw("'touched-by-b@example.com'")).
+		Name("trg_guard_test_b")
+
+	if err := client.Register(context.Background(), trA, trB); err != nil {
+		t.Fatalf("Register: %v", err)
+	}
+	t.Cleanup(func() { _ = client.Drop(context.Background(), trB) })
+
+	if err := client.Drop(context.Background(), trA); err != nil {
+		t.Fatalf("Drop trA: %v", err)
+	}
+
+	user := testutil.UserMaster{Name: "Original", Email: fmt.Sprintf("orig-sqlite-%d@example.com", time.Now().UnixNano())}
+	if err := db.Create(&user).Error; err != nil {
+		t.Fatalf("Create: %v", err)
+	}
+
+	if err := db.Model(&user).UpdateColumn("name", "Changed").Error; err != nil {
+		t.Fatalf("UpdateColumn: %v", err)
+	}
+
+	var reloaded testutil.UserMaster
+	if err := db.First(&reloaded, user.ID).Error; err != nil {
+		t.Fatalf("First: %v", err)
+	}
+	if reloaded.Name == "touched-by-a" {
+		t.Errorf("Name = %q, trA fired but should have been dropped", reloaded.Name)
+	}
+	if reloaded.Email != "touched-by-b@example.com" {
+		t.Errorf("Email = %q, want %q (trB should still fire after trA was dropped, "+
+			"proving dropTrigger didn't remove dbobjects_guard out from under it)", reloaded.Email, "touched-by-b@example.com")
+	}
+}
+
+// guardRecoveryRow backs TestRegister_SQLite_GuardRecoversFromFailedCorrectiveUpdate
+// -- a table with a CHECK constraint the trigger's Set() is deliberately
+// engineered to violate, and no AutoMigrate involvement (its CREATE
+// TABLE is issued directly so the CHECK constraint is exact).
+type guardRecoveryRow struct {
+	ID     uint `gorm:"primaryKey"`
+	Status string
+}
+
+func (guardRecoveryRow) TableName() string { return "guard_recovery_rows" }
+
+// TestRegister_SQLite_GuardRecoversFromFailedCorrectiveUpdate is the
+// launch-gate test for docs/PLAN.md §3.1b decision #3's open risk:
+// whether a failed corrective UPDATE rolls back the dbobjects_guard
+// INSERT that already ran in the same trigger firing, or leaves it
+// stuck. SQLite's own docs don't settle this (checked directly against
+// lang_conflict.html/lang_transaction.html) -- this proves it live.
+// If this test fails, the guard-table design itself needs to be
+// reconsidered; there's no SQLite-native fallback (no exception-handler
+// equivalent) to patch around it with.
+func TestRegister_SQLite_GuardRecoversFromFailedCorrectiveUpdate(t *testing.T) {
+	db, err := testutil.NewSQLite(newSQLiteDSN(t))
+	if err != nil {
+		t.Skipf("skipping integration test, no SQLite available: %v", err)
+	}
+
+	if err := db.Exec(`CREATE TABLE guard_recovery_rows (
+		id INTEGER PRIMARY KEY AUTOINCREMENT,
+		status TEXT NOT NULL DEFAULT 'ok' CHECK (status != 'bad')
+	)`).Error; err != nil {
+		t.Fatalf("creating table: %v", err)
+	}
+
+	client := dbobjects.NewClient(db)
+	// Deliberately broken: the corrective UPDATE this renders always
+	// tries to set status = 'bad', which the CHECK constraint always
+	// rejects.
+	tr := trigger.AfterUpdate(&guardRecoveryRow{}).Set("status", trigger.Raw("'bad'"))
+	if err := client.Register(context.Background(), tr); err != nil {
+		t.Fatalf("Register: %v", err)
+	}
+
+	row := guardRecoveryRow{Status: "ok"}
+	if err := db.Create(&row).Error; err != nil {
+		t.Fatalf("Create: %v", err)
+	}
+
+	// First UPDATE: fires the AFTER UPDATE trigger; its corrective
+	// UPDATE fails the CHECK constraint, on purpose.
+	if err := db.Exec(`UPDATE guard_recovery_rows SET status = 'ok' WHERE id = ?`, row.ID).Error; err == nil {
+		t.Fatal("expected the corrective UPDATE to fail the CHECK constraint, got nil error")
+	}
+
+	var guardCount int64
+	if err := db.Raw(`SELECT count(*) FROM dbobjects_guard`).Scan(&guardCount).Error; err != nil {
+		t.Fatalf("querying dbobjects_guard: %v", err)
+	}
+	if guardCount != 0 {
+		t.Fatalf("dbobjects_guard has %d stuck row(s) after a failed corrective UPDATE -- "+
+			"SQLite's per-statement atomicity did not protect the guard table; "+
+			"the guard-table design (docs/PLAN.md §3.1b decision #3) must be re-opened, not patched around", guardCount)
+	}
+
+	// Second UPDATE: if the guard were stuck, its WHEN clause would see
+	// an existing guard row and skip the trigger body entirely, so this
+	// would silently succeed. It must fail again, identically -- proof
+	// the trigger actually re-fired, not that it was silently disabled.
+	if err := db.Exec(`UPDATE guard_recovery_rows SET status = 'ok' WHERE id = ?`, row.ID).Error; err == nil {
+		t.Fatal("expected the trigger to fire again and fail again; a nil error here means the guard is stuck and silently disabling the trigger")
+	}
+}
+
+// TestRegister_SQLite_RecursionGuardSurvivesConcurrentConnections is the
+// other launch-gate test for docs/PLAN.md §3.1b decision #3: proving
+// the dbobjects_guard table -- a real, permanent schema object chosen
+// specifically because SQLite TEMP tables/PRAGMAs are connection-scoped
+// and invisible across a pooled *gorm.DB's separate physical
+// connections -- actually works when the trigger fires from several
+// distinct connections at once. recursive_triggers defaults OFF in
+// SQLite, so this test has to manufacture the scenario the guard exists
+// for: PRAGMA recursive_triggers = ON is set explicitly on each
+// goroutine's own reserved *sql.Conn (not just db.Exec, which could
+// land on any pooled connection) immediately before that same
+// connection issues its UPDATE, guaranteeing the pragma is in effect
+// for the connection that actually runs the trigger cascade.
+func TestRegister_SQLite_RecursionGuardSurvivesConcurrentConnections(t *testing.T) {
+	db, err := testutil.NewSQLite(newSQLiteDSN(t))
+	if err != nil {
+		t.Skipf("skipping integration test, no SQLite available: %v", err)
+	}
+
+	if err := db.AutoMigrate(&testutil.UserMaster{}); err != nil {
+		t.Fatalf("AutoMigrate: %v", err)
+	}
+
+	client := dbobjects.NewClient(db)
+	tr := trigger.AfterUpdate(&testutil.UserMaster{}).Set("updated_at", trigger.Now())
+	if err := client.Register(context.Background(), tr); err != nil {
+		t.Fatalf("Register: %v", err)
+	}
+
+	user := testutil.UserMaster{Name: "Concurrent", Email: fmt.Sprintf("concurrent-sqlite-%d@example.com", time.Now().UnixNano())}
+	if err := db.Create(&user).Error; err != nil {
+		t.Fatalf("Create: %v", err)
+	}
+
+	sqlDB, err := db.DB()
+	if err != nil {
+		t.Fatalf("db.DB(): %v", err)
+	}
+
+	const n = 8
+	errs := make(chan error, n)
+	var wg sync.WaitGroup
+	for i := 0; i < n; i++ {
+		wg.Add(1)
+		go func(i int) {
+			defer wg.Done()
+			ctx, cancel := context.WithTimeout(context.Background(), 15*time.Second)
+			defer cancel()
+
+			conn, err := sqlDB.Conn(ctx)
+			if err != nil {
+				errs <- fmt.Errorf("goroutine %d: Conn: %w", i, err)
+				return
+			}
+			defer conn.Close()
+
+			// Same physical connection for both statements, so the
+			// pragma is guaranteed to be in effect for the UPDATE (and
+			// therefore for the trigger cascade it fires) below.
+			if _, err := conn.ExecContext(ctx, "PRAGMA recursive_triggers = ON"); err != nil {
+				errs <- fmt.Errorf("goroutine %d: PRAGMA: %w", i, err)
+				return
+			}
+			if _, err := conn.ExecContext(ctx, "UPDATE user_master SET name = ? WHERE id = ?",
+				fmt.Sprintf("updated-%d", i), user.ID); err != nil {
+				errs <- fmt.Errorf("goroutine %d: UPDATE: %w", i, err)
+				return
+			}
+		}(i)
+	}
+
+	done := make(chan struct{})
+	go func() {
+		wg.Wait()
+		close(done)
+	}()
+
+	select {
+	case <-done:
+	case <-time.After(30 * time.Second):
+		t.Fatal("timed out waiting for concurrent updates -- possible infinite recursion, the guard did not cross the connection pool")
+	}
+	close(errs)
+	for err := range errs {
+		if err != nil {
+			t.Errorf("concurrent update failed: %v", err)
+		}
+	}
+
+	var guardCount int64
+	if err := db.Raw(`SELECT count(*) FROM dbobjects_guard`).Scan(&guardCount).Error; err != nil {
+		t.Fatalf("querying dbobjects_guard: %v", err)
+	}
+	if guardCount != 0 {
+		t.Errorf("dbobjects_guard has %d leftover row(s) after all concurrent updates settled, want 0", guardCount)
 	}
 }

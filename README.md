@@ -35,15 +35,15 @@ as a runtime error against a live database.
 ## Status
 
 Triggers and views are both implemented and tested end-to-end on
-Postgres and MySQL — including a real, verified rollback path for
-engines where DDL isn't transactional, and a view built from a live
+Postgres, MySQL, and SQLite — including a real, verified rollback path
+for engines where DDL isn't transactional, and a view built from a live
 gorm query callback, not just a raw SQL string. Procedures are designed
 but not yet built — see the design notes below.
 
-| | Postgres | MySQL | SQL Server | SQLite | Oracle |
+| | Postgres | MySQL | SQLite | SQL Server | Oracle |
 |---|:---:|:---:|:---:|:---:|:---:|
-| Triggers | ✅ | ✅ | planned | planned | planned |
-| Views | ✅ | ✅ | planned | planned | planned |
+| Triggers | ✅ | ✅ | ✅ | planned | planned |
+| Views | ✅ | ✅ | ✅ | planned | planned |
 | Procedures | planned | planned | planned | planned | planned |
 
 ## Install
@@ -95,7 +95,7 @@ func main() {
     _ = client.Drop(context.Background(), tr)
 
     // Or just see the generated SQL without touching the DB.
-    stmts, _ := client.Render([]dbobjects.DBObject{tr}, dbobjects.Idempotent)
+    stmts, _ := client.Render(dbobjects.Idempotent, tr)
     for _, s := range stmts {
         log.Println(s)
     }
@@ -204,7 +204,7 @@ Atlas parses the DDL itself and computes its own diff — conditional SQL
 just gets in its way:
 
 ```go
-stmts, _ := client.Render([]dbobjects.DBObject{tr}, dbobjects.Declarative)
+stmts, _ := client.Render(dbobjects.Declarative, tr)
 ```
 
 ## Testing
@@ -217,8 +217,10 @@ go test ./...
 
 Integration tests connect to real Postgres and MySQL instances,
 configured via a `.env` file at the repo root (see `.env.example`) —
-they skip themselves automatically if no database is reachable. CI runs
-both, via service containers, on every push.
+they skip themselves automatically if no database is reachable. SQLite
+integration tests need no configuration or service at all (embedded,
+file-based) and run unconditionally. CI runs Postgres and MySQL as
+service containers, and SQLite directly, on every push.
 
 ## License
 
