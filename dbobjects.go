@@ -246,8 +246,10 @@ const (
 	Declarative
 )
 
-// Render returns the DDL for each object without executing it.
-func (c *Client) Render(objects []DBObject, mode RenderMode) ([]string, error) {
+// Render returns the DDL for each object without executing it. Takes
+// mode before objects, matching Register/Drop's shape (their fixed
+// ctx param first, variadic objects last).
+func (c *Client) Render(mode RenderMode, objects ...DBObject) ([]string, error) {
 	d, err := c.resolveDialect("Render")
 	if err != nil {
 		return nil, err
