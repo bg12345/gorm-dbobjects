@@ -7,7 +7,7 @@
 **Manage database-side objects — triggers, views, stored procedures —
 as Go code, across multiple database engines, on top of [gorm](https://gorm.io).**
 
-## Why is this
+## Why
 
 gorm gets you most of the way to a working schema: `AutoMigrate` handles
 tables, columns, indexes. It has nothing for the things that live
