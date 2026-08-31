@@ -6,6 +6,8 @@ are release-tag dates.
 
 ## [Unreleased]
 
+## [v0.5.0] - 2026-08-31
+
 ### Added
 - SQL Server trigger + view dialect. SQL Server has no `BEFORE` DML
   trigger at all (only `AFTER`/`FOR` and `INSTEAD OF`, deliberately
