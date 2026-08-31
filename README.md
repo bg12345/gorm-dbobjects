@@ -35,15 +35,16 @@ as a runtime error against a live database.
 ## Status
 
 Triggers and views are both implemented and tested end-to-end on
-Postgres, MySQL, and SQLite — including a real, verified rollback path
-for engines where DDL isn't transactional, and a view built from a live
-gorm query callback, not just a raw SQL string. Procedures are designed
-but not yet built — see the design notes below.
+Postgres, MySQL, SQLite, and SQL Server — including a real, verified
+rollback path for engines where DDL isn't transactional, and a view
+built from a live gorm query callback, not just a raw SQL string.
+Procedures are designed but not yet built — see the design notes below.
+Release history: [CHANGELOG.md](CHANGELOG.md).
 
 | | Postgres | MySQL | SQLite | SQL Server | Oracle |
 |---|:---:|:---:|:---:|:---:|:---:|
-| Triggers | ✅ | ✅ | ✅ | planned | planned |
-| Views | ✅ | ✅ | ✅ | planned | planned |
+| Triggers | ✅ | ✅ | ✅ | ✅ | planned |
+| Views | ✅ | ✅ | ✅ | ✅ | planned |
 | Procedures | planned | planned | planned | planned | planned |
 
 ## Install
@@ -158,7 +159,7 @@ v := view.New("recent_signups").
 
 ## How it's built
 
-Each object kind (`trigger`, and eventually `view`, `procedure`) is its
+Each object kind (`trigger`, `view`, and eventually `procedure`) is its
 own small package with a fluent builder and zero knowledge of SQL
 dialects — `trigger.BeforeUpdate(&User{}).Set(...)` only knows about
 gorm schemas. A separate dialect layer, resolved from the connected
@@ -215,12 +216,19 @@ Unit tests run with no setup:
 go test ./...
 ```
 
-Integration tests connect to real Postgres and MySQL instances,
-configured via a `.env` file at the repo root (see `.env.example`) —
-they skip themselves automatically if no database is reachable. SQLite
-integration tests need no configuration or service at all (embedded,
-file-based) and run unconditionally. CI runs Postgres and MySQL as
-service containers, and SQLite directly, on every push.
+Integration tests connect to real Postgres, MySQL, and SQL Server
+instances, configured via a `.env` file at the repo root (see
+`.env.example`) — they skip themselves automatically if no database is
+reachable. SQLite integration tests need no configuration or service at
+all (embedded, file-based) and run unconditionally. CI runs Postgres,
+MySQL, and SQL Server as service containers, and SQLite directly, on
+every push. See [CONTRIBUTING.md](CONTRIBUTING.md) for local setup,
+including SQL Server's Docker one-liner.
+
+## Contributing
+
+See [CONTRIBUTING.md](CONTRIBUTING.md) — local setup, how the test
+suite is organized, and how to add support for a new database engine.
 
 ## License
 
