@@ -49,11 +49,16 @@ type Definition struct {
 	Body   string // raw full trigger body; required for DELETE (no NEW row to assign into)
 	Name   string // optional; if empty, dbobjects will generate one
 
-	// PrimaryKey is the table's single primary key column, set only when
-	// Timing is AFTER and Sets is non-empty. NEW isn't assignable once an
-	// AFTER trigger fires (the row's already written), so the dialect
-	// renders Set() there as an explicit follow-up UPDATE targeting this
-	// column instead of NEW.col = expr -- see dialect.go's renderTrigger.
+	// PrimaryKey is the table's single primary key column, resolved
+	// best-effort whenever Sets is non-empty (regardless of Timing) and
+	// the table has exactly one primary key field; empty otherwise. Used
+	// by dialects that render Set() as a follow-up UPDATE targeting this
+	// column instead of NEW.col = expr -- Postgres/MySQL for AFTER
+	// triggers (NEW isn't assignable once an AFTER trigger fires, the
+	// row's already written) and SQL Server for every Set()-based
+	// trigger (SQL Server has no BEFORE DML trigger at all, so Set()
+	// always renders AFTER there). Unused by SQLite, which targets
+	// rowid instead. See dialect.go's renderTrigger per dialect.
 	PrimaryKey string
 }
 
@@ -160,16 +165,28 @@ func (t *triggerBuilder) Build() (*Definition, error) {
 		return nil, fmt.Errorf("trigger: no columns set and no Body provided for table %q", t.schema.Table)
 	}
 
+	// Resolved best-effort whenever Set() was used, regardless of
+	// declared timing: Postgres/MySQL's AFTER-trigger follow-up UPDATE
+	// needs it (see Definition.PrimaryKey / dialect.go's renderTrigger),
+	// and so does SQL Server's Set()-based UPDATE ... FROM join, which
+	// forces AFTER under the hood even for a BEFORE-declared trigger
+	// (SQL Server has no BEFORE DML trigger at all). Only AFTER hard-
+	// errors here, exactly as before -- Postgres/MySQL never read
+	// PrimaryKey on a BEFORE-declared trigger (NEW.col = expr doesn't
+	// need it) and SQLite never reads it at all (uses rowid instead), so
+	// leaving it unset/empty for a BEFORE-declared trigger on a
+	// composite-or-missing-PK table stays harmless for every dialect
+	// that doesn't need it, and SQL Server's own dialect surfaces its
+	// own render-time error when it does need it and finds it empty.
 	var pk string
-	if t.timing == "AFTER" && len(t.sets) > 0 {
-		// AFTER-trigger Set() renders as a follow-up UPDATE (see
-		// Definition.PrimaryKey / dialect.go's renderTrigger), which
-		// needs exactly one primary key column to target the right row.
-		if len(t.schema.PrimaryFields) != 1 {
+	if len(t.sets) > 0 {
+		switch {
+		case len(t.schema.PrimaryFields) == 1:
+			pk = t.schema.PrimaryFields[0].DBName
+		case t.timing == "AFTER":
 			return nil, fmt.Errorf("trigger: AFTER trigger with Set() requires exactly one primary key column on table %q, found %d",
 				t.schema.Table, len(t.schema.PrimaryFields))
 		}
-		pk = t.schema.PrimaryFields[0].DBName
 	}
 
 	return &Definition{

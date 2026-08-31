@@ -41,6 +41,21 @@ jobs:
           --health-timeout=5s
           --health-retries=10
 
+      sqlserver:
+        image: mcr.microsoft.com/mssql/server:latest
+        env:
+          ACCEPT_EULA: Y
+          # Test-only credential, matching this repo's existing
+          # postgres/mysql precedent of literal, non-secret test creds.
+          MSSQL_SA_PASSWORD: "yourStrong(!)Password1"
+        ports:
+          - 1433:1433
+        options: >-
+          --health-cmd="/opt/mssql-tools18/bin/sqlcmd -C -S localhost -U sa -P 'yourStrong(!)Password1' -Q 'SELECT 1'"
+          --health-interval=10s
+          --health-timeout=5s
+          --health-retries=10
+
     env:
       POSTGRES_HOST: localhost
       POSTGRES_USER: postgres
@@ -54,6 +69,12 @@ jobs:
       MYSQL_PASSWORD: root
       MYSQL_DB: dbobjects_test
       MYSQL_PORT: 3306
+
+      MSSQL_HOST: localhost
+      MSSQL_USER: sa
+      MSSQL_PASSWORD: "yourStrong(!)Password1"
+      MSSQL_DB: dbobjects_test
+      MSSQL_PORT: 1433
 
     steps:
       - name: Checkout
@@ -72,6 +93,24 @@ jobs:
 
       - name: Vet
         run: go vet ./...
+
+      # Unlike the postgres/mysql images (POSTGRES_DB/MYSQL_DATABASE
+      # provision a named database on startup), the mssql/server image
+      # only stands up the engine (default master) -- no equivalent env
+      # var creates one, so it's provisioned explicitly here rather than
+      # inside internal/testutil.NewSQLServer (which, like NewPostgres/
+      # NewMySQL, only opens a connection and issues no DDL itself).
+      # sqlcmd lives inside the service container's own image, not on
+      # the runner -- --health-cmd above runs inside the container
+      # automatically via Docker's own healthcheck mechanism, but this
+      # step is a normal run: step executing on the runner, so it has to
+      # reach sqlcmd via docker exec against the running service
+      # container instead of calling the binary path directly.
+      - name: Create SQL Server test database
+        run: |
+          docker exec $(docker ps -q --filter ancestor=mcr.microsoft.com/mssql/server:latest) \
+            /opt/mssql-tools18/bin/sqlcmd -C -S localhost -U sa -P "$MSSQL_PASSWORD" \
+            -Q "IF NOT EXISTS (SELECT * FROM sys.databases WHERE name = N'$MSSQL_DB') CREATE DATABASE $MSSQL_DB;"
 
       - name: Test
         run: go test -race -v ./...

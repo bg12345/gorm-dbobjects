@@ -2,6 +2,7 @@ package tests
 
 import (
 	"fmt"
+	"os"
 	"path/filepath"
 	"sync"
 	"testing"
@@ -96,19 +97,47 @@ func TestTrigger_AfterUpdate_Set_RequiresSinglePrimaryKey(t *testing.T) {
 	}
 }
 
-// TestTrigger_BeforeUpdate_Set_NoPrimaryKeyRequired confirms PrimaryKey
-// resolution is scoped to AFTER triggers only -- a BEFORE trigger renders
-// Set() as a direct NEW.col assignment and never needs one, so Build()
-// shouldn't require (or populate) it there.
-func TestTrigger_BeforeUpdate_Set_NoPrimaryKeyRequired(t *testing.T) {
+// TestTrigger_BeforeUpdate_Set_PrimaryKeyResolvedBestEffort confirms
+// PrimaryKey is now resolved for a BEFORE trigger too, whenever the
+// table has exactly one primary key column -- widened so SQL Server's
+// Set()-based UPDATE ... FROM join (which forces AFTER under the hood
+// even for a BEFORE-declared trigger, since SQL Server has no BEFORE
+// DML trigger at all) has something to target. Harmless for
+// Postgres/MySQL, which never read PrimaryKey on a BEFORE-declared
+// trigger (NEW.col = expr doesn't need it).
+func TestTrigger_BeforeUpdate_Set_PrimaryKeyResolvedBestEffort(t *testing.T) {
 	def, err := trigger.BeforeUpdate(&testutil.UserMaster{}).
 		Set("updated_at", trigger.Now()).
 		Build()
 	if err != nil {
 		t.Fatalf("Build() error = %v", err)
 	}
+	if def.PrimaryKey != "id" {
+		t.Errorf("PrimaryKey = %q, want %q", def.PrimaryKey, "id")
+	}
+}
+
+// TestTrigger_BeforeUpdate_Set_CompositePrimaryKeyLeavesEmpty confirms
+// a BEFORE trigger on a composite/missing-PK table still doesn't error
+// at Build() time (unlike AFTER, which hard-errors there) -- it just
+// leaves PrimaryKey empty, since only a dialect that actually needs it
+// for a BEFORE-declared trigger (SQL Server) should surface an error,
+// and only that dialect knows it needs one.
+func TestTrigger_BeforeUpdate_Set_CompositePrimaryKeyLeavesEmpty(t *testing.T) {
+	type compositeKeyModel struct {
+		OrgID  string `gorm:"primaryKey"`
+		UserID string `gorm:"primaryKey"`
+		Status string
+	}
+
+	def, err := trigger.BeforeUpdate(&compositeKeyModel{}).
+		Set("status", trigger.Raw("'x'")).
+		Build()
+	if err != nil {
+		t.Fatalf("Build() error = %v, want no error for a BEFORE trigger on a composite-PK table", err)
+	}
 	if def.PrimaryKey != "" {
-		t.Errorf("PrimaryKey = %q, want empty for a BEFORE trigger", def.PrimaryKey)
+		t.Errorf("PrimaryKey = %q, want empty", def.PrimaryKey)
 	}
 }
 
@@ -1092,5 +1121,172 @@ func TestRegister_SQLite_RecursionGuardSurvivesConcurrentConnections(t *testing.
 	}
 	if guardCount != 0 {
 		t.Errorf("dbobjects_guard has %d leftover row(s) after all concurrent updates settled, want 0", guardCount)
+	}
+}
+
+// --- SQL Server ---
+
+// TestRegister_SQLServer_AppliesTrigger is an integration test verifying
+// a BeforeUpdate(...).Set(...) trigger fires for real on SQL Server,
+// despite being translated to a literal AFTER UPDATE trigger under the
+// hood (SQL Server has no BEFORE DML trigger at all -- see
+// dialect.go's sqlServerDialect.triggerBody) -- the caller-observable
+// behavior must match Postgres/MySQL/SQLite's BeforeUpdate(...).Set(...)
+// even though the underlying mechanism (a set-based UPDATE ... FROM
+// inserted join, not a row-level NEW.col assignment) differs entirely.
+// Skips itself if no SQL Server is reachable.
+func TestRegister_SQLServer_AppliesTrigger(t *testing.T) {
+	db, err := testutil.NewSQLServer()
+	if err != nil {
+		t.Skipf("skipping integration test, no SQL Server reachable: %v", err)
+	}
+
+	if err := db.AutoMigrate(&testutil.UserMaster{}); err != nil {
+		t.Fatalf("AutoMigrate: %v", err)
+	}
+
+	client := dbobjects.NewClient(db)
+	tr := trigger.BeforeUpdate(&testutil.UserMaster{}).Set("updated_at", trigger.Now())
+	if err := client.Register(context.Background(), tr); err != nil {
+		t.Fatalf("Register: %v", err)
+	}
+	t.Cleanup(func() { _ = client.Drop(context.Background(), tr) })
+
+	user := testutil.UserMaster{Name: "Ada", Email: fmt.Sprintf("ada-sqlserver-%d@example.com", time.Now().UnixNano())}
+	if err := db.Create(&user).Error; err != nil {
+		t.Fatalf("Create: %v", err)
+	}
+	t.Cleanup(func() { db.Unscoped().Delete(&user) })
+
+	old := time.Now().Add(-24 * time.Hour).Truncate(time.Second)
+	if err := db.Model(&user).UpdateColumn("updated_at", old).Error; err != nil {
+		t.Fatalf("UpdateColumn: %v", err)
+	}
+
+	var reloaded testutil.UserMaster
+	if err := db.First(&reloaded, user.ID).Error; err != nil {
+		t.Fatalf("First: %v", err)
+	}
+	if reloaded.UpdatedAt.Equal(old) {
+		t.Fatal("UpdatedAt still equals the value we tried to force; trigger did not fire")
+	}
+	if time.Since(reloaded.UpdatedAt) > 10*time.Second {
+		t.Fatalf("UpdatedAt = %v, want a timestamp close to now (trigger should have set GETDATE())", reloaded.UpdatedAt)
+	}
+}
+
+// TestRegister_SQLServer_AppliesDeleteTrigger is an integration test
+// verifying an AfterDelete(...).Body(...) trigger fires for real on a
+// real DELETE, and specifically exercises the deleted-not-OLD
+// portability note: SQL Server has no NEW/OLD at all, so this Body()
+// references the deleted pseudo-table by its real name -- a Body()
+// string copy-pasted from the Postgres/MySQL/SQLite examples elsewhere
+// in this test file (which use OLD.id) would silently fail here.
+func TestRegister_SQLServer_AppliesDeleteTrigger(t *testing.T) {
+	db, err := testutil.NewSQLServer()
+	if err != nil {
+		t.Skipf("skipping integration test, no SQL Server reachable: %v", err)
+	}
+
+	if err := db.AutoMigrate(&testutil.UserMaster{}); err != nil {
+		t.Fatalf("AutoMigrate: %v", err)
+	}
+	if err := db.Exec(`IF NOT EXISTS (SELECT * FROM sys.tables WHERE name = 'user_master_delete_audit')
+		CREATE TABLE user_master_delete_audit (
+			id INT IDENTITY(1,1) PRIMARY KEY,
+			deleted_user_id INT NOT NULL
+		)`).Error; err != nil {
+		t.Fatalf("creating audit table: %v", err)
+	}
+	t.Cleanup(func() { db.Exec("DROP TABLE IF EXISTS user_master_delete_audit") })
+
+	client := dbobjects.NewClient(db)
+	tr := trigger.AfterDelete(&testutil.UserMaster{}).
+		Body("INSERT INTO user_master_delete_audit(deleted_user_id) SELECT id FROM deleted;")
+	if err := client.Register(context.Background(), tr); err != nil {
+		t.Fatalf("Register: %v", err)
+	}
+	t.Cleanup(func() { _ = client.Drop(context.Background(), tr) })
+
+	user := testutil.UserMaster{Name: "Grace", Email: fmt.Sprintf("grace-sqlserver-%d@example.com", time.Now().UnixNano())}
+	if err := db.Create(&user).Error; err != nil {
+		t.Fatalf("Create: %v", err)
+	}
+	if err := db.Unscoped().Delete(&user).Error; err != nil {
+		t.Fatalf("Delete: %v", err)
+	}
+
+	var count int64
+	if err := db.Raw(`SELECT count(*) FROM user_master_delete_audit WHERE deleted_user_id = ?`, user.ID).
+		Scan(&count).Error; err != nil {
+		t.Fatalf("querying audit table: %v", err)
+	}
+	if count != 1 {
+		t.Errorf("audit rows for deleted user = %d, want 1 (AFTER DELETE trigger should have fired)", count)
+	}
+}
+
+// TestRegister_SQLServer_RecursionGuardUnderExplicitRecursiveTriggersOn
+// proves TRIGGER_NESTLEVEL() > 1 actually stops the recursion it's
+// meant to stop, live. RECURSIVE_TRIGGERS defaults OFF in SQL Server
+// (verified directly against learn.microsoft.com, docs/PLAN.md §3.1c),
+// so this test has to force the scenario the guard exists for by
+// explicitly turning it on for the test database, the same
+// "manufacture the scenario" reasoning SQLite's equivalent concurrent
+// test already uses. Unlike SQLite's guard table, there's no
+// dbobjects-owned state here that can leak or get stuck -- this is
+// confirming the engine builtin behaves as documented, not settling an
+// open risk the way SQLite's two launch-gate tests were.
+func TestRegister_SQLServer_RecursionGuardUnderExplicitRecursiveTriggersOn(t *testing.T) {
+	db, err := testutil.NewSQLServer()
+	if err != nil {
+		t.Skipf("skipping integration test, no SQL Server reachable: %v", err)
+	}
+
+	if err := db.AutoMigrate(&testutil.UserMaster{}); err != nil {
+		t.Fatalf("AutoMigrate: %v", err)
+	}
+
+	dbName := os.Getenv("MSSQL_DB")
+	if err := db.Exec(fmt.Sprintf("ALTER DATABASE %s SET RECURSIVE_TRIGGERS ON", dbName)).Error; err != nil {
+		t.Fatalf("ALTER DATABASE ... SET RECURSIVE_TRIGGERS ON: %v", err)
+	}
+	t.Cleanup(func() {
+		db.Exec(fmt.Sprintf("ALTER DATABASE %s SET RECURSIVE_TRIGGERS OFF", dbName))
+	})
+
+	client := dbobjects.NewClient(db)
+	tr := trigger.AfterUpdate(&testutil.UserMaster{}).Set("updated_at", trigger.Now())
+	if err := client.Register(context.Background(), tr); err != nil {
+		t.Fatalf("Register: %v", err)
+	}
+	t.Cleanup(func() { _ = client.Drop(context.Background(), tr) })
+
+	user := testutil.UserMaster{Name: "Recursive", Email: fmt.Sprintf("recursive-sqlserver-%d@example.com", time.Now().UnixNano())}
+	if err := db.Create(&user).Error; err != nil {
+		t.Fatalf("Create: %v", err)
+	}
+	t.Cleanup(func() { db.Unscoped().Delete(&user) })
+
+	done := make(chan error, 1)
+	go func() {
+		done <- db.Model(&user).UpdateColumn("name", "Recursive Updated").Error
+	}()
+
+	select {
+	case err := <-done:
+		if err != nil {
+			t.Fatalf("UpdateColumn: %v", err)
+		}
+	case <-time.After(20 * time.Second):
+		t.Fatal("timed out -- possible infinite recursion, TRIGGER_NESTLEVEL guard did not stop it")
+	}
+
+	var reloaded testutil.UserMaster
+	if err := db.First(&reloaded, user.ID).Error; err != nil {
+		t.Fatalf("First: %v", err)
+	}
+	if time.Since(reloaded.UpdatedAt) > 10*time.Second {
+		t.Errorf("UpdatedAt = %v, want a timestamp close to now (trigger should still have fired once)", reloaded.UpdatedAt)
 	}
 }
