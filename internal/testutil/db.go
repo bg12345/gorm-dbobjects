@@ -11,6 +11,7 @@ import (
 	"github.com/joho/godotenv"
 	"gorm.io/driver/mysql"
 	"gorm.io/driver/sqlite"
+	"gorm.io/driver/sqlserver"
 )
 
 // loadEnv loads the repo-root .env regardless of the calling test
@@ -66,4 +67,19 @@ func NewMySQL() (*gorm.DB,error){
 // sharing one configured connection target.
 func NewSQLite(dsn string) (*gorm.DB, error) {
 	return gorm.Open(sqlite.Open(dsn), &gorm.Config{})
+}
+
+func NewSQLServer() (*gorm.DB, error) {
+	loadEnv()
+
+	dsn := fmt.Sprintf(
+		"sqlserver://%s:%s@%s:%s?database=%s",
+		os.Getenv("MSSQL_USER"),
+		os.Getenv("MSSQL_PASSWORD"),
+		os.Getenv("MSSQL_HOST"),
+		os.Getenv("MSSQL_PORT"),
+		os.Getenv("MSSQL_DB"),
+	)
+
+	return gorm.Open(sqlserver.Open(dsn), &gorm.Config{})
 }

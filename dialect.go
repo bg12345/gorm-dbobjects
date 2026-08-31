@@ -29,9 +29,10 @@ type dialect interface {
 }
 
 var dialects = map[string]dialect{
-	"postgres": postgresDialect{},
-	"mysql":    mysqlDialect{},
-	"sqlite":   sqliteDialect{},
+	"postgres":  postgresDialect{},
+	"mysql":     mysqlDialect{},
+	"sqlite":    sqliteDialect{},
+	"sqlserver": sqlServerDialect{},
 }
 
 func dialectFor(name string) (dialect, bool) {
@@ -69,6 +70,16 @@ func (sqliteDialect) transactional() bool {
 	return true
 }
 
+type sqlServerDialect struct{}
+
+func (sqlServerDialect) Name() string {
+	return "sqlserver"
+}
+
+func (sqlServerDialect) transactional() bool {
+	return true
+}
+
 
 // renderExpr resolves e to this dialect's SQL spelling. Postgres and
 // MySQL both happen to spell "current timestamp" as NOW(); other
@@ -96,6 +107,22 @@ func (sqliteDialect) renderExpr(e trigger.Expr) string {
 	switch e.Kind {
 	case trigger.ExprNow:
 		return "CURRENT_TIMESTAMP"
+	default:
+		return e.Raw
+	}
+}
+
+// GETDATE() over SYSDATETIME()/SYSUTCDATETIME(): the idiomatic,
+// long-standing spelling (Microsoft's own CREATE TRIGGER examples use
+// it), and this project already tolerates cross-engine Now()
+// inconsistency (Postgres/MySQL local time, SQLite UTC) rather than
+// normalizing it, so there's no concrete reason to reach for
+// SYSUTCDATETIME()'s different return type (datetime2, sub-millisecond
+// precision) here specifically.
+func (sqlServerDialect) renderExpr(e trigger.Expr) string {
+	switch e.Kind {
+	case trigger.ExprNow:
+		return "GETDATE()"
 	default:
 		return e.Raw
 	}
@@ -443,6 +470,130 @@ func (sqliteDialect) dropTrigger(def *trigger.Definition) ([]string, error) {
 	return []string{fmt.Sprintf(`DROP TRIGGER IF EXISTS %s;`, trgName)}, nil
 }
 
+// sqlServerAfterConstructorHint names the After* constructor a BEFORE
+// + Body() error should point callers at, for def's event.
+func sqlServerAfterConstructorHint(event string) string {
+	switch event {
+	case "INSERT":
+		return "AfterInsert"
+	case "UPDATE":
+		return "AfterUpdate"
+	case "DELETE":
+		return "AfterDelete"
+	default:
+		return "After" + event
+	}
+}
+
+// triggerBody renders the BEGIN...END body for def's trigger, or an
+// error when def can't be rendered on SQL Server at all -- two cases:
+//
+//   - Body() on a BEFORE-declared trigger: unlike Set() (mechanically
+//     forced to AFTER and semantically equivalent either way -- the row
+//     ends up in the same state), Body() is caller-authored SQL that
+//     assumes a specific firing point relative to the write. SQL Server
+//     has no mechanism -- not even INSTEAD OF, a different statement-
+//     replacement primitive (works on tables too, not just views, but
+//     nothing is written unless the trigger body issues its own
+//     INSERT/UPDATE/DELETE, and constraints check *after* it runs, not
+//     before) -- deliberately not used here -- that makes "run this
+//     before the write, with the write still happening automatically
+//     afterward" safe. Silently coercing Body()'s declared timing the
+//     way Set() safely can would be a correctness bug dressed as
+//     flexibility, so it's a render-time error instead.
+//   - Set() on a table with no usable primary key (Definition.PrimaryKey
+//     empty): SQL Server has no rowid-style fallback the way SQLite
+//     does, so a composite or missing primary key genuinely can't be
+//     targeted by the UPDATE ... FROM inserted join below.
+func (d sqlServerDialect) triggerBody(def *trigger.Definition) (string, error) {
+	if def.Body != "" {
+		if def.Timing == "BEFORE" {
+			return "", fmt.Errorf("dbobjects: sqlserver has no BEFORE trigger of any kind (not even Body()-based) -- declare this as %s instead, or issue a raw INSTEAD OF trigger outside this library if you need to intercept the write itself",
+				sqlServerAfterConstructorHint(def.Event))
+		}
+		return fmt.Sprintf("  %s\n", def.Body), nil
+	}
+
+	if def.PrimaryKey == "" {
+		return "", fmt.Errorf("dbobjects: sqlserver Set() requires table %q to have exactly one primary key column (found none or a composite key) to target the UPDATE ... FROM inserted join",
+			def.Table)
+	}
+
+	columns := sortedSetColumns(def.Sets)
+	assigns := make([]string, len(columns))
+	for i, column := range columns {
+		assigns[i] = fmt.Sprintf("%s = %s", column, d.renderExpr(def.Sets[column]))
+	}
+	// Set-based join-update, not a single-row WHERE: a SQL Server
+	// trigger fires once per statement, and inserted/deleted can hold
+	// zero, one, or many rows in that one firing, not just one.
+	updateStmt := fmt.Sprintf("UPDATE t SET %s FROM %s AS t INNER JOIN inserted AS i ON t.%s = i.%s;",
+		strings.Join(assigns, ", "), def.Table, def.PrimaryKey, def.PrimaryKey)
+
+	if def.Event != "UPDATE" {
+		// AFTER INSERT can't recurse into itself via this UPDATE.
+		return fmt.Sprintf("  %s\n", updateStmt), nil
+	}
+
+	// This UPDATE re-fires this same AFTER UPDATE trigger.
+	// TRIGGER_NESTLEVEL() is SQL Server's real analog of Postgres's
+	// pg_trigger_depth() -- a genuine engine-maintained call-stack
+	// counter, not a home-grown table the way SQLite needed (SQL Server
+	// has no rowid-style gap forcing that kind of workaround here).
+	// > 1 means we're already inside the recursive firing.
+	return fmt.Sprintf("  IF TRIGGER_NESTLEVEL() > 1 RETURN;\n  %s\n", updateStmt), nil
+}
+
+// createTriggerStmt renders the CREATE TRIGGER statement itself --
+// shared by renderTrigger and renderTriggerDeclarative. Timing is
+// always the literal AFTER: the Set() path forces it (triggerBody), and
+// the Body() path never reaches here with a BEFORE timing at all --
+// triggerBody already returned an error before this is called. orAlter
+// is "OR ALTER " for the idempotent path, "" for declarative.
+func (sqlServerDialect) createTriggerStmt(def *trigger.Definition, trgName, orAlter, body string) string {
+	return fmt.Sprintf(`CREATE %sTRIGGER %s ON %s AFTER %s AS
+BEGIN
+  SET NOCOUNT ON;
+%sEND;`, orAlter, trgName, def.Table, def.Event, body)
+}
+
+// renderTrigger renders CREATE OR ALTER TRIGGER as a single statement,
+// no DROP -- unlike MySQL/SQLite (no CREATE OR REPLACE/ALTER TRIGGER at
+// all, need DROP IF EXISTS + CREATE as two statements), SQL Server's own
+// OR ALTER fully redefines the trigger -- including its event list --
+// in one statement, so a separate DROP first would be redundant, the
+// same way Postgres's CREATE OR REPLACE FUNCTION needs no DROP either.
+func (d sqlServerDialect) renderTrigger(def *trigger.Definition) ([]string, error) {
+	_, trgName := triggerNames(def)
+	body, err := d.triggerBody(def)
+	if err != nil {
+		return nil, err
+	}
+	return []string{d.createTriggerStmt(def, trgName, "OR ALTER ", body)}, nil
+}
+
+func (d sqlServerDialect) renderTriggerDeclarative(def *trigger.Definition) ([]string, error) {
+	_, trgName := triggerNames(def)
+	body, err := d.triggerBody(def)
+	if err != nil {
+		return nil, err
+	}
+	return []string{d.createTriggerStmt(def, trgName, "", body)}, nil
+}
+
+func (sqlServerDialect) dropTrigger(def *trigger.Definition) ([]string, error) {
+	_, trgName := triggerNames(def)
+	return []string{fmt.Sprintf(`DROP TRIGGER IF EXISTS %s;`, trgName)}, nil
+}
+
+// Known cosmetic-only quirk, same as SQLite's already-documented
+// equivalent: the auto-generated trigger name (from the shared
+// triggerNames helper) is derived from def.Timing, so a
+// BeforeUpdate(...).Set(...) trigger is named trg_<table>_before_update
+// while its real DDL is AFTER UPDATE (Set() always forces AFTER here --
+// see triggerBody). Harmless: renderTrigger and dropTrigger both derive
+// the name from def.Timing identically, so they always agree.
+
 
 // resolveViewBody returns def's view body: RawSQL verbatim if set,
 // otherwise fully-interpolated SQL from QueryFn via db.ToSQL. Shared by
@@ -482,6 +633,13 @@ func renderViewCreateOrReplace(db *gorm.DB, def *view.Definition) ([]string, err
 // renderViewCreateOrReplace is.
 func renderViewCreate(db *gorm.DB, def *view.Definition) ([]string, error) {
 	return []string{fmt.Sprintf(`CREATE VIEW %s AS %s`, def.Name, resolveViewBody(db, def))}, nil
+}
+
+// renderViewCreateOrAlter renders def as a CREATE OR ALTER VIEW
+// statement -- SQL Server's own idempotent-native spelling; not
+// CREATE OR REPLACE VIEW (Postgres/MySQL's keyword, not valid T-SQL).
+func renderViewCreateOrAlter(db *gorm.DB, def *view.Definition) ([]string, error) {
+	return []string{fmt.Sprintf(`CREATE OR ALTER VIEW %s AS %s`, def.Name, resolveViewBody(db, def))}, nil
 }
 
 // dropViewIfExists renders a DROP VIEW IF EXISTS statement -- shared
@@ -536,9 +694,28 @@ func (sqliteDialect) dropView(def *view.Definition) ([]string, error) {
 	return dropViewIfExists(def)
 }
 
+// renderView, renderViewDeclarative, and dropView are pure composition
+// of the shared helpers -- same as SQLite's view story, zero new
+// rendering logic. CREATE OR ALTER VIEW (2016 SP1+) is idempotent-
+// native, so unlike sqliteDialect's renderView this doesn't need a
+// DROP-first composition -- one statement is enough.
+func (sqlServerDialect) renderView(db *gorm.DB, def *view.Definition) ([]string, error) {
+	return renderViewCreateOrAlter(db, def)
+}
+
+func (sqlServerDialect) renderViewDeclarative(db *gorm.DB, def *view.Definition) ([]string, error) {
+	return renderViewCreate(db, def)
+}
+
+func (sqlServerDialect) dropView(def *view.Definition) ([]string, error) {
+	return dropViewIfExists(def)
+}
+
 var _ triggerDialect = postgresDialect{}
 var _ triggerDialect = mysqlDialect{}
 var _ triggerDialect = sqliteDialect{}
+var _ triggerDialect = sqlServerDialect{}
 var _ viewDialect = postgresDialect{}
 var _ viewDialect = mysqlDialect{}
 var _ viewDialect = sqliteDialect{}
+var _ viewDialect = sqlServerDialect{}

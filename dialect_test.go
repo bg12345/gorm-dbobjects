@@ -824,3 +824,288 @@ func TestSQLiteDialect_DropView(t *testing.T) {
 		t.Errorf("dropView()[0] = %q, want %q", stmts[0], want)
 	}
 }
+
+// SQL Server has no BEFORE DML trigger at all (only AFTER/INSTEAD OF),
+// and its triggers are set-based (inserted/deleted can hold zero, one,
+// or many rows per firing, not a single NEW/OLD row alias) -- so Set()
+// always renders AFTER with a join-update against Definition.PrimaryKey
+// (SQL Server has no rowid-style fallback the way SQLite does), and
+// Body() on a BEFORE-declared trigger is a hard error rather than a
+// silent AFTER coercion, since SQL Server has no mechanism that makes
+// that translation safe the way Set()'s forced translation is.
+
+func TestSQLServerDialect_RenderExpr(t *testing.T) {
+	d := sqlServerDialect{}
+	tests := []struct {
+		name string
+		expr trigger.Expr
+		want string
+	}{
+		{"Now", trigger.Now(), "GETDATE()"},
+		{"Raw", trigger.Raw("version + 1"), "version + 1"},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			if got := d.renderExpr(tt.expr); got != tt.want {
+				t.Errorf("renderExpr(%+v) = %q, want %q", tt.expr, got, tt.want)
+			}
+		})
+	}
+}
+
+func TestSQLServerDialect_RenderTrigger_BeforeUpdateSet_RendersAsAfter(t *testing.T) {
+	def := &trigger.Definition{
+		Table:      "accounts",
+		Timing:     "BEFORE",
+		Event:      "UPDATE",
+		Sets:       map[string]trigger.Expr{"status": trigger.Raw("'synced'")},
+		PrimaryKey: "id",
+	}
+
+	stmts, err := sqlServerDialect{}.renderTrigger(def)
+	if err != nil {
+		t.Fatalf("renderTrigger() error = %v", err)
+	}
+	sql := strings.Join(stmts, "\n")
+	if !strings.Contains(sql, "AFTER UPDATE") {
+		t.Errorf("renderTrigger() output missing \"AFTER UPDATE\", got:\n%s", sql)
+	}
+	if strings.Contains(sql, "BEFORE") {
+		t.Errorf("renderTrigger() should not contain a literal BEFORE, got:\n%s", sql)
+	}
+}
+
+func TestSQLServerDialect_RenderTrigger_AfterUpdateSetEndToEnd(t *testing.T) {
+	def := &trigger.Definition{
+		Table:      "accounts",
+		Timing:     "AFTER",
+		Event:      "UPDATE",
+		Sets:       map[string]trigger.Expr{"status": trigger.Raw("'synced'")},
+		PrimaryKey: "id",
+	}
+
+	stmts, err := sqlServerDialect{}.renderTrigger(def)
+	if err != nil {
+		t.Fatalf("renderTrigger() error = %v", err)
+	}
+	sql := strings.Join(stmts, "\n")
+	for _, want := range []string{
+		"IF TRIGGER_NESTLEVEL() > 1 RETURN;",
+		"UPDATE t SET status = 'synced' FROM accounts AS t INNER JOIN inserted AS i ON t.id = i.id;",
+		"CREATE OR ALTER TRIGGER",
+	} {
+		if !strings.Contains(sql, want) {
+			t.Errorf("renderTrigger() output missing %q, got:\n%s", want, sql)
+		}
+	}
+}
+
+func TestSQLServerDialect_RenderTrigger_AfterInsertSetEndToEnd(t *testing.T) {
+	def := &trigger.Definition{
+		Table:      "accounts",
+		Timing:     "AFTER",
+		Event:      "INSERT",
+		Sets:       map[string]trigger.Expr{"status": trigger.Raw("'new'")},
+		PrimaryKey: "id",
+	}
+
+	stmts, err := sqlServerDialect{}.renderTrigger(def)
+	if err != nil {
+		t.Fatalf("renderTrigger() error = %v", err)
+	}
+	sql := strings.Join(stmts, "\n")
+	if want := "UPDATE t SET status = 'new' FROM accounts AS t INNER JOIN inserted AS i ON t.id = i.id;"; !strings.Contains(sql, want) {
+		t.Errorf("renderTrigger() output missing %q, got:\n%s", want, sql)
+	}
+	if strings.Contains(sql, "TRIGGER_NESTLEVEL") {
+		t.Errorf("renderTrigger() should not need a recursion guard on AFTER INSERT, got:\n%s", sql)
+	}
+}
+
+func TestSQLServerDialect_RenderTrigger_Set_NoPrimaryKey_Errors(t *testing.T) {
+	def := &trigger.Definition{
+		Table:  "accounts",
+		Timing: "AFTER",
+		Event:  "UPDATE",
+		Sets:   map[string]trigger.Expr{"status": trigger.Raw("'synced'")},
+		// PrimaryKey deliberately left empty -- composite or missing PK.
+	}
+
+	_, err := sqlServerDialect{}.renderTrigger(def)
+	if err == nil {
+		t.Fatal("renderTrigger() error = nil, want error for Set() with no resolvable primary key")
+	}
+}
+
+func TestSQLServerDialect_RenderTrigger_BeforeInsertBody_Errors(t *testing.T) {
+	def := &trigger.Definition{Table: "accounts", Timing: "BEFORE", Event: "INSERT", Body: "SELECT 1;"}
+	_, err := sqlServerDialect{}.renderTrigger(def)
+	if err == nil {
+		t.Fatal("renderTrigger() error = nil, want error for Body() on a BEFORE INSERT trigger")
+	}
+}
+
+func TestSQLServerDialect_RenderTrigger_BeforeUpdateBody_Errors(t *testing.T) {
+	def := &trigger.Definition{Table: "accounts", Timing: "BEFORE", Event: "UPDATE", Body: "SELECT 1;"}
+	_, err := sqlServerDialect{}.renderTrigger(def)
+	if err == nil {
+		t.Fatal("renderTrigger() error = nil, want error for Body() on a BEFORE UPDATE trigger")
+	}
+}
+
+func TestSQLServerDialect_RenderTrigger_BeforeDeleteBody_Errors(t *testing.T) {
+	def := &trigger.Definition{Table: "accounts", Timing: "BEFORE", Event: "DELETE", Body: "SELECT 1;"}
+	_, err := sqlServerDialect{}.renderTrigger(def)
+	if err == nil {
+		t.Fatal("renderTrigger() error = nil, want error for Body() on a BEFORE DELETE trigger")
+	}
+}
+
+func TestSQLServerDialect_RenderTrigger_AfterDeleteBodyEndToEnd(t *testing.T) {
+	def := &trigger.Definition{
+		Table:  "accounts",
+		Timing: "AFTER",
+		Event:  "DELETE",
+		Body:   "INSERT INTO audit(id) VALUES ((SELECT id FROM deleted));",
+	}
+
+	stmts, err := sqlServerDialect{}.renderTrigger(def)
+	if err != nil {
+		t.Fatalf("renderTrigger() error = %v", err)
+	}
+	sql := strings.Join(stmts, "\n")
+	if want := "INSERT INTO audit(id) VALUES ((SELECT id FROM deleted));"; !strings.Contains(sql, want) {
+		t.Errorf("renderTrigger() output missing %q, got:\n%s", want, sql)
+	}
+	if !strings.Contains(sql, "AFTER DELETE") {
+		t.Errorf("renderTrigger() output missing \"AFTER DELETE\", got:\n%s", sql)
+	}
+}
+
+func TestSQLServerDialect_RenderTriggerDeclarative_StatementShape(t *testing.T) {
+	def := &trigger.Definition{
+		Table:      "accounts",
+		Timing:     "AFTER",
+		Event:      "UPDATE",
+		Sets:       map[string]trigger.Expr{"status": trigger.Raw("'synced'")},
+		PrimaryKey: "id",
+	}
+
+	stmts, err := sqlServerDialect{}.renderTriggerDeclarative(def)
+	if err != nil {
+		t.Fatalf("renderTriggerDeclarative() error = %v", err)
+	}
+	if len(stmts) != 1 {
+		t.Fatalf("renderTriggerDeclarative() returned %d statement(s), want 1 (no DROP, no OR ALTER):\n%s",
+			len(stmts), strings.Join(stmts, "\n---\n"))
+	}
+	if strings.Contains(stmts[0], "OR ALTER") || strings.Contains(stmts[0], "DROP") {
+		t.Errorf("renderTriggerDeclarative() output should contain neither OR ALTER nor DROP, got:\n%s", stmts[0])
+	}
+}
+
+func TestSQLServerDialect_RenderTriggerDeclarative_BodyMatchesIdempotent(t *testing.T) {
+	def := &trigger.Definition{
+		Table:      "accounts",
+		Timing:     "AFTER",
+		Event:      "UPDATE",
+		Sets:       map[string]trigger.Expr{"status": trigger.Raw("'synced'")},
+		PrimaryKey: "id",
+	}
+
+	idempotent, err := sqlServerDialect{}.renderTrigger(def)
+	if err != nil {
+		t.Fatalf("renderTrigger() error = %v", err)
+	}
+	declarative, err := sqlServerDialect{}.renderTriggerDeclarative(def)
+	if err != nil {
+		t.Fatalf("renderTriggerDeclarative() error = %v", err)
+	}
+
+	idempotentSQL := strings.Join(idempotent, "\n")
+	declarativeSQL := strings.Join(declarative, "\n")
+	for _, want := range []string{
+		"IF TRIGGER_NESTLEVEL() > 1 RETURN;",
+		"UPDATE t SET status = 'synced' FROM accounts AS t INNER JOIN inserted AS i ON t.id = i.id;",
+	} {
+		if !strings.Contains(idempotentSQL, want) {
+			t.Fatalf("test setup: idempotent output missing %q, got:\n%s", want, idempotentSQL)
+		}
+		if !strings.Contains(declarativeSQL, want) {
+			t.Errorf("renderTriggerDeclarative() body diverged from renderTrigger(): missing %q, got:\n%s", want, declarativeSQL)
+		}
+	}
+}
+
+func TestSQLServerDialect_DropTrigger_StatementShape(t *testing.T) {
+	def := &trigger.Definition{
+		Table:  "accounts",
+		Timing: "AFTER",
+		Event:  "UPDATE",
+		Body:   "SELECT 1;",
+	}
+
+	stmts, err := sqlServerDialect{}.dropTrigger(def)
+	if err != nil {
+		t.Fatalf("dropTrigger() error = %v", err)
+	}
+	if len(stmts) != 1 {
+		t.Fatalf("dropTrigger() returned %d statement(s), want 1", len(stmts))
+	}
+	if want := "DROP TRIGGER IF EXISTS trg_accounts_after_update;"; stmts[0] != want {
+		t.Errorf("dropTrigger()[0] = %q, want %q", stmts[0], want)
+	}
+}
+
+func TestSQLServerDialect_RenderView_Raw(t *testing.T) {
+	def := &view.Definition{
+		Name:   "active_users",
+		RawSQL: "SELECT * FROM user_master WHERE deleted_at IS NULL",
+	}
+
+	stmts, err := sqlServerDialect{}.renderView(nil, def)
+	if err != nil {
+		t.Fatalf("renderView() error = %v", err)
+	}
+	if len(stmts) != 1 {
+		t.Fatalf("renderView() returned %d statement(s), want 1:\n%s", len(stmts), strings.Join(stmts, "\n---\n"))
+	}
+	want := `CREATE OR ALTER VIEW active_users AS SELECT * FROM user_master WHERE deleted_at IS NULL`
+	if stmts[0] != want {
+		t.Errorf("renderView()[0] = %q, want %q", stmts[0], want)
+	}
+}
+
+func TestSQLServerDialect_RenderViewDeclarative_Raw(t *testing.T) {
+	def := &view.Definition{
+		Name:   "active_users",
+		RawSQL: "SELECT * FROM user_master WHERE deleted_at IS NULL",
+	}
+
+	stmts, err := sqlServerDialect{}.renderViewDeclarative(nil, def)
+	if err != nil {
+		t.Fatalf("renderViewDeclarative() error = %v", err)
+	}
+	if len(stmts) != 1 {
+		t.Fatalf("renderViewDeclarative() returned %d statement(s), want 1:\n%s", len(stmts), strings.Join(stmts, "\n---\n"))
+	}
+	want := `CREATE VIEW active_users AS SELECT * FROM user_master WHERE deleted_at IS NULL`
+	if stmts[0] != want {
+		t.Errorf("renderViewDeclarative()[0] = %q, want %q", stmts[0], want)
+	}
+}
+
+func TestSQLServerDialect_DropView(t *testing.T) {
+	def := &view.Definition{Name: "active_users"}
+
+	stmts, err := sqlServerDialect{}.dropView(def)
+	if err != nil {
+		t.Fatalf("dropView() error = %v", err)
+	}
+	if len(stmts) != 1 {
+		t.Fatalf("dropView() returned %d statement(s), want 1:\n%s", len(stmts), strings.Join(stmts, "\n---\n"))
+	}
+	if want := "DROP VIEW IF EXISTS active_users;"; stmts[0] != want {
+		t.Errorf("dropView()[0] = %q, want %q", stmts[0], want)
+	}
+}
