@@ -34,18 +34,18 @@ as a runtime error against a live database.
 
 ## Status
 
-Triggers and views are both implemented and tested end-to-end on
-Postgres, MySQL, SQLite, and SQL Server — including a real, verified
-rollback path for engines where DDL isn't transactional, and a view
-built from a live gorm query callback, not just a raw SQL string.
-Procedures are designed but not yet built — see the design notes below.
-Release history: [CHANGELOG.md](CHANGELOG.md).
+Triggers, views, and stored procedures are all implemented and tested
+end-to-end on Postgres, MySQL, and SQL Server (triggers and views also
+on SQLite, which has no stored procedure concept at all) — including a
+real, verified rollback path for engines where DDL isn't transactional,
+and a view built from a live gorm query callback, not just a raw SQL
+string. Release history: [CHANGELOG.md](CHANGELOG.md).
 
 | | Postgres | MySQL | SQLite | SQL Server | Oracle |
 |---|:---:|:---:|:---:|:---:|:---:|
 | Triggers | ✅ | ✅ | ✅ | ✅ | planned |
 | Views | ✅ | ✅ | ✅ | ✅ | planned |
-| Procedures | planned | planned | planned | planned | planned |
+| Procedures | ✅ | ✅ | n/a | ✅ | planned |
 
 ## Install
 
@@ -156,6 +156,31 @@ v := view.New("recent_signups").
     }).
     Raw("SELECT * FROM (SELECT * FROM users ORDER BY created_at DESC) WHERE ROWNUM <= 100")
 ```
+
+Stored procedures generate the signature/wrapper ceremony the same way
+— `CREATE OR REPLACE PROCEDURE`, `DROP IF EXISTS` + `CREATE`, `CREATE OR
+ALTER PROCEDURE` — around a raw SQL body, since control flow (loops,
+cursors, exception handling) can't be abstracted portably across
+engines the way a flat column assignment can:
+
+```go
+proc := procedure.New("recalc_balances").
+    Param("user_id", procedure.Int).
+    Body("UPDATE accounts SET balance = balance + 1 WHERE id = user_id;")
+
+if err := client.Register(context.Background(), proc); err != nil {
+    log.Fatal(err)
+}
+```
+
+`Param` types are either a portable constant/constructor
+(`procedure.Int`, `Text`, `Bool`, `Time`, `Varchar(n)`, `Char(n)`,
+`Decimal(p,s)`, `Float`, `Bytes`), `procedure.Raw(sqlType)` for anything engine-specific
+(Postgres `JSONB`, SQL Server `UNIQUEIDENTIFIER`), or
+`procedure.TypeOf(&Account{}, "ID")` to derive one from an existing
+model field so it tracks the column instead of drifting if the column's
+type changes later. Not supported on SQLite, which has no stored
+procedure concept at all.
 
 ## How it's built
 

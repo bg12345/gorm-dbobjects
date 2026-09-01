@@ -6,6 +6,23 @@ are release-tag dates.
 
 ## [Unreleased]
 
+### Added
+- Stored procedures on Postgres, MySQL, and SQL Server —
+  `procedure.New(name).Param(...).Body(...)`. `dbobjects` generates the
+  signature/wrapper ceremony per engine (`CREATE OR REPLACE PROCEDURE`,
+  `DROP IF EXISTS` + `CREATE`, `CREATE OR ALTER PROCEDURE`); the body
+  itself stays a single caller-authored SQL string, since control flow
+  (loops, cursors, exception handling) can't be abstracted portably the
+  way a trigger's flat column assignment can. `Param` types are a small
+  portable set (`Int`/`Text`/`Bool`/`Time`/`Varchar(n)`/`Char(n)`/
+  `Decimal(p,s)`/`Float`/`Bytes`), a `Raw(sqlType)` escape hatch, or
+  `TypeOf(&Model{}, "Field")` deriving one from an existing gorm field
+  (errors for a `Uint` field specifically — Postgres/SQL Server have no
+  native unsigned integer type at all). Not supported on
+  SQLite, which has no stored procedure concept at all — rejected via
+  the same dialect-capability mechanism trigger/view already use, no
+  SQLite-specific code needed.
+
 ## [v0.5.0] - 2026-08-31
 
 ### Added

@@ -5,6 +5,7 @@ import (
 	"sort"
 	"strings"
 
+	"github.com/bg12345/gorm-dbobjects/procedure"
 	"github.com/bg12345/gorm-dbobjects/trigger"
 	"github.com/bg12345/gorm-dbobjects/view"
 	"gorm.io/gorm"
@@ -21,6 +22,17 @@ type viewDialect interface {
 	renderView(db *gorm.DB, def *view.Definition) ([]string, error)
 	renderViewDeclarative(db *gorm.DB, def *view.Definition) ([]string, error)
 	dropView(def *view.Definition) ([]string, error)
+}
+
+// procedureDialect is implemented only by engines with a real stored
+// procedure concept -- Postgres, MySQL, SQL Server. Not sqliteDialect
+// (SQLite has none at all): resolveDDL's existing d.(procedureDialect)
+// type-assertion failure already produces the right rejection once a
+// dialect simply doesn't implement this, no SQLite-specific code needed.
+type procedureDialect interface {
+	renderProcedure(def *procedure.Definition) ([]string, error)
+	renderProcedureDeclarative(def *procedure.Definition) ([]string, error)
+	dropProcedure(def *procedure.Definition) ([]string, error)
 }
 
 type dialect interface {
@@ -710,6 +722,234 @@ func (sqlServerDialect) renderViewDeclarative(db *gorm.DB, def *view.Definition)
 func (sqlServerDialect) dropView(def *view.Definition) ([]string, error) {
 	return dropViewIfExists(def)
 }
+
+// validateSizedParam checks Varchar/Char/Decimal's numeric arguments --
+// shared by every dialect's paramType since the constraint itself
+// (positive size, positive precision, a scale that fits within it)
+// doesn't vary by engine, only the resulting type name's spelling does.
+func validateSizedParam(t procedure.ParamType) error {
+	switch t.Kind {
+	case procedure.ParamVarchar, procedure.ParamChar:
+		if t.Size <= 0 {
+			return fmt.Errorf("dbobjects: procedure param size must be positive, got %d", t.Size)
+		}
+	case procedure.ParamDecimal:
+		if t.Size <= 0 {
+			return fmt.Errorf("dbobjects: procedure param precision must be positive, got %d", t.Size)
+		}
+		if t.Scale < 0 || t.Scale > t.Size {
+			return fmt.Errorf("dbobjects: procedure param scale must be between 0 and precision (%d), got %d", t.Size, t.Scale)
+		}
+	}
+	return nil
+}
+
+func (postgresDialect) paramType(t procedure.ParamType) (string, error) {
+	if err := validateSizedParam(t); err != nil {
+		return "", err
+	}
+	switch t.Kind {
+	case procedure.ParamInt:
+		return "INT", nil
+	case procedure.ParamText:
+		return "TEXT", nil
+	case procedure.ParamBool:
+		return "BOOLEAN", nil
+	case procedure.ParamTime:
+		return "TIMESTAMP", nil
+	case procedure.ParamVarchar:
+		return fmt.Sprintf("VARCHAR(%d)", t.Size), nil
+	case procedure.ParamChar:
+		return fmt.Sprintf("CHAR(%d)", t.Size), nil
+	case procedure.ParamDecimal:
+		return fmt.Sprintf("DECIMAL(%d,%d)", t.Size, t.Scale), nil
+	case procedure.ParamFloat:
+		return "DOUBLE PRECISION", nil
+	case procedure.ParamBytes:
+		return "BYTEA", nil
+	default: // ParamRaw
+		return t.Raw, nil
+	}
+}
+
+func (mysqlDialect) paramType(t procedure.ParamType) (string, error) {
+	if err := validateSizedParam(t); err != nil {
+		return "", err
+	}
+	switch t.Kind {
+	case procedure.ParamInt:
+		return "INT", nil
+	case procedure.ParamText:
+		return "TEXT", nil
+	case procedure.ParamBool:
+		return "BOOLEAN", nil
+	case procedure.ParamTime:
+		return "DATETIME", nil
+	case procedure.ParamVarchar:
+		return fmt.Sprintf("VARCHAR(%d)", t.Size), nil
+	case procedure.ParamChar:
+		return fmt.Sprintf("CHAR(%d)", t.Size), nil
+	case procedure.ParamDecimal:
+		return fmt.Sprintf("DECIMAL(%d,%d)", t.Size, t.Scale), nil
+	case procedure.ParamFloat:
+		return "DOUBLE", nil
+	case procedure.ParamBytes:
+		return "BLOB", nil
+	default: // ParamRaw
+		return t.Raw, nil
+	}
+}
+
+// paramType's sized-string variants stay N-prefixed (NVARCHAR/NCHAR),
+// same reasoning as Text's own NVARCHAR(MAX) choice -- a consistent
+// Unicode-safe default across every string-shaped portable type on
+// this engine, not just the unsized one.
+func (sqlServerDialect) paramType(t procedure.ParamType) (string, error) {
+	if err := validateSizedParam(t); err != nil {
+		return "", err
+	}
+	switch t.Kind {
+	case procedure.ParamInt:
+		return "INT", nil
+	case procedure.ParamText:
+		return "NVARCHAR(MAX)", nil
+	case procedure.ParamBool:
+		return "BIT", nil
+	case procedure.ParamTime:
+		return "DATETIME2", nil
+	case procedure.ParamVarchar:
+		return fmt.Sprintf("NVARCHAR(%d)", t.Size), nil
+	case procedure.ParamChar:
+		return fmt.Sprintf("NCHAR(%d)", t.Size), nil
+	case procedure.ParamDecimal:
+		return fmt.Sprintf("DECIMAL(%d,%d)", t.Size, t.Scale), nil
+	case procedure.ParamFloat:
+		return "FLOAT", nil
+	case procedure.ParamBytes:
+		return "VARBINARY(MAX)", nil
+	default: // ParamRaw
+		return t.Raw, nil
+	}
+}
+
+// procedureParamList renders def's params as a comma-joined signature
+// fragment. paramType resolves each param's dialect-specific SQL type;
+// sig formats the per-engine ceremony around it (Postgres: "name TYPE";
+// MySQL: "IN name TYPE"; SQL Server: "@name TYPE") -- shared here since
+// the iteration/error-wrapping is identical, only that ceremony varies.
+func procedureParamList(def *procedure.Definition, paramType func(procedure.ParamType) (string, error), sig func(name, sqlType string) string) (string, error) {
+	parts := make([]string, len(def.Params))
+	for i, p := range def.Params {
+		t, err := paramType(p.Type)
+		if err != nil {
+			return "", fmt.Errorf("dbobjects: procedure %q param %q: %w", def.Name, p.Name, err)
+		}
+		parts[i] = sig(p.Name, t)
+	}
+	return strings.Join(parts, ", "), nil
+}
+
+func postgresProcedureSig(name, sqlType string) string { return name + " " + sqlType }
+
+func (d postgresDialect) renderProcedure(def *procedure.Definition) ([]string, error) {
+	params, err := procedureParamList(def, d.paramType, postgresProcedureSig)
+	if err != nil {
+		return nil, err
+	}
+	create := fmt.Sprintf(`CREATE OR REPLACE PROCEDURE %s(%s) LANGUAGE plpgsql AS $$
+BEGIN
+  %s
+END;
+$$;`, def.Name, params, def.Body)
+	return []string{create}, nil
+}
+
+func (d postgresDialect) renderProcedureDeclarative(def *procedure.Definition) ([]string, error) {
+	params, err := procedureParamList(def, d.paramType, postgresProcedureSig)
+	if err != nil {
+		return nil, err
+	}
+	create := fmt.Sprintf(`CREATE PROCEDURE %s(%s) LANGUAGE plpgsql AS $$
+BEGIN
+  %s
+END;
+$$;`, def.Name, params, def.Body)
+	return []string{create}, nil
+}
+
+func (postgresDialect) dropProcedure(def *procedure.Definition) ([]string, error) {
+	return []string{fmt.Sprintf(`DROP PROCEDURE IF EXISTS %s;`, def.Name)}, nil
+}
+
+func mysqlProcedureSig(name, sqlType string) string { return "IN " + name + " " + sqlType }
+
+// renderProcedure: MySQL has no CREATE OR REPLACE PROCEDURE, so
+// idempotent is DROP PROCEDURE IF EXISTS + bare CREATE as two
+// statements, the same shape MySQL's trigger rendering already uses.
+func (d mysqlDialect) renderProcedure(def *procedure.Definition) ([]string, error) {
+	params, err := procedureParamList(def, d.paramType, mysqlProcedureSig)
+	if err != nil {
+		return nil, err
+	}
+	dropStmt := fmt.Sprintf(`DROP PROCEDURE IF EXISTS %s;`, def.Name)
+	create := fmt.Sprintf(`CREATE PROCEDURE %s(%s) BEGIN
+  %s
+END`, def.Name, params, def.Body)
+	return []string{dropStmt, create}, nil
+}
+
+func (d mysqlDialect) renderProcedureDeclarative(def *procedure.Definition) ([]string, error) {
+	params, err := procedureParamList(def, d.paramType, mysqlProcedureSig)
+	if err != nil {
+		return nil, err
+	}
+	create := fmt.Sprintf(`CREATE PROCEDURE %s(%s) BEGIN
+  %s
+END`, def.Name, params, def.Body)
+	return []string{create}, nil
+}
+
+func (mysqlDialect) dropProcedure(def *procedure.Definition) ([]string, error) {
+	return []string{fmt.Sprintf(`DROP PROCEDURE IF EXISTS %s;`, def.Name)}, nil
+}
+
+func sqlServerProcedureSig(name, sqlType string) string { return "@" + name + " " + sqlType }
+
+// createProcedureStmt renders the CREATE PROCEDURE statement itself --
+// shared by renderProcedure and renderProcedureDeclarative. orAlter is
+// "OR ALTER " for the idempotent path, "" for declarative. Unlike a
+// function/procedure's parenthesized param list on Postgres/MySQL, T-SQL
+// procedure params are listed bare after the name, no parens.
+func (sqlServerDialect) createProcedureStmt(def *procedure.Definition, orAlter, params string) string {
+	return fmt.Sprintf(`CREATE %sPROCEDURE %s %s AS
+BEGIN
+  %s
+END;`, orAlter, def.Name, params, def.Body)
+}
+
+func (d sqlServerDialect) renderProcedure(def *procedure.Definition) ([]string, error) {
+	params, err := procedureParamList(def, d.paramType, sqlServerProcedureSig)
+	if err != nil {
+		return nil, err
+	}
+	return []string{d.createProcedureStmt(def, "OR ALTER ", params)}, nil
+}
+
+func (d sqlServerDialect) renderProcedureDeclarative(def *procedure.Definition) ([]string, error) {
+	params, err := procedureParamList(def, d.paramType, sqlServerProcedureSig)
+	if err != nil {
+		return nil, err
+	}
+	return []string{d.createProcedureStmt(def, "", params)}, nil
+}
+
+func (sqlServerDialect) dropProcedure(def *procedure.Definition) ([]string, error) {
+	return []string{fmt.Sprintf(`DROP PROCEDURE IF EXISTS %s;`, def.Name)}, nil
+}
+
+var _ procedureDialect = postgresDialect{}
+var _ procedureDialect = mysqlDialect{}
+var _ procedureDialect = sqlServerDialect{}
 
 var _ triggerDialect = postgresDialect{}
 var _ triggerDialect = mysqlDialect{}
