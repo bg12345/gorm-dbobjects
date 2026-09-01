@@ -767,6 +767,8 @@ func (postgresDialect) paramType(t procedure.ParamType) (string, error) {
 		return "DOUBLE PRECISION", nil
 	case procedure.ParamBytes:
 		return "BYTEA", nil
+	case procedure.ParamJSON:
+		return "JSONB", nil
 	default: // ParamRaw
 		return t.Raw, nil
 	}
@@ -795,6 +797,8 @@ func (mysqlDialect) paramType(t procedure.ParamType) (string, error) {
 		return "DOUBLE", nil
 	case procedure.ParamBytes:
 		return "BLOB", nil
+	case procedure.ParamJSON:
+		return "JSON", nil
 	default: // ParamRaw
 		return t.Raw, nil
 	}
@@ -827,6 +831,11 @@ func (sqlServerDialect) paramType(t procedure.ParamType) (string, error) {
 		return "FLOAT", nil
 	case procedure.ParamBytes:
 		return "VARBINARY(MAX)", nil
+	case procedure.ParamJSON:
+		// No native JSON type at all -- stored and queried (ISJSON,
+		// JSON_VALUE, JSON_QUERY, OPENJSON) over nvarchar(max), the same
+		// representation Microsoft's own docs use.
+		return "NVARCHAR(MAX)", nil
 	default: // ParamRaw
 		return t.Raw, nil
 	}

@@ -1129,6 +1129,7 @@ func TestPostgresDialect_ParamType(t *testing.T) {
 		{"Decimal", procedure.Decimal(10, 2), "DECIMAL(10,2)"},
 		{"Float", procedure.Float, "DOUBLE PRECISION"},
 		{"Bytes", procedure.Bytes, "BYTEA"},
+		{"JSON", procedure.JSON, "JSONB"},
 		{"Raw", procedure.Raw("JSONB"), "JSONB"},
 	}
 	for _, tt := range tests {
@@ -1224,6 +1225,7 @@ func TestMySQLDialect_ParamType(t *testing.T) {
 		{"Time", procedure.Time, "DATETIME"},
 		{"Float", procedure.Float, "DOUBLE"},
 		{"Bytes", procedure.Bytes, "BLOB"},
+		{"JSON", procedure.JSON, "JSON"},
 	}
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {
@@ -1323,6 +1325,7 @@ func TestSQLServerDialect_ParamType(t *testing.T) {
 		{"Char", procedure.Char(10), "NCHAR(10)"},
 		{"Float", procedure.Float, "FLOAT"},
 		{"Bytes", procedure.Bytes, "VARBINARY(MAX)"},
+		{"JSON", procedure.JSON, "NVARCHAR(MAX)"},
 	}
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {

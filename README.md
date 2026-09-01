@@ -175,7 +175,7 @@ if err := client.Register(context.Background(), proc); err != nil {
 
 `Param` types are either a portable constant/constructor
 (`procedure.Int`, `Text`, `Bool`, `Time`, `Varchar(n)`, `Char(n)`,
-`Decimal(p,s)`, `Float`, `Bytes`), `procedure.Raw(sqlType)` for anything engine-specific
+`Decimal(p,s)`, `Float`, `Bytes`, `JSON`), `procedure.Raw(sqlType)` for anything engine-specific
 (Postgres `JSONB`, SQL Server `UNIQUEIDENTIFIER`), or
 `procedure.TypeOf(&Account{}, "ID")` to derive one from an existing
 model field so it tracks the column instead of drifting if the column's

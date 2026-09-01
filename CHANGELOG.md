@@ -15,10 +15,17 @@ are release-tag dates.
   (loops, cursors, exception handling) can't be abstracted portably the
   way a trigger's flat column assignment can. `Param` types are a small
   portable set (`Int`/`Text`/`Bool`/`Time`/`Varchar(n)`/`Char(n)`/
-  `Decimal(p,s)`/`Float`/`Bytes`), a `Raw(sqlType)` escape hatch, or
-  `TypeOf(&Model{}, "Field")` deriving one from an existing gorm field
-  (errors for a `Uint` field specifically — Postgres/SQL Server have no
-  native unsigned integer type at all). Not supported on
+  `Decimal(p,s)`/`Float`/`Bytes`/`JSON`), a `Raw(sqlType)` escape hatch,
+  or `TypeOf(&Model{}, "Field")` deriving one from an existing gorm
+  field — including recognizing `gorm.io/datatypes.JSON` fields (a real
+  dependency now, matched by exact type) and `json.RawMessage`
+  specifically as `JSON` (renders as Postgres `JSONB`, MySQL's native
+  `JSON`, SQL Server's `NVARCHAR(MAX)` — no native JSON type there at
+  all; `json.RawMessage` needed its own case since it's plain `[]byte`
+  to gorm with no gorm-awareness, which would otherwise silently
+  resolve to `Bytes` instead). Errors
+  for a `Uint` field specifically — Postgres/SQL Server have no native
+  unsigned integer type at all. Not supported on
   SQLite, which has no stored procedure concept at all — rejected via
   the same dialect-capability mechanism trigger/view already use, no
   SQLite-specific code needed.

@@ -1,11 +1,31 @@
 package procedure
 
 import (
+	"encoding/json"
 	"fmt"
+	"reflect"
 	"sync"
 
+	"gorm.io/datatypes"
 	"gorm.io/gorm/schema"
 )
+
+// rawMessageType identifies a json.RawMessage field (or *json.RawMessage
+// -- compared against IndirectFieldType, which gorm already
+// pointer-dereferences) so TypeOf can special-case it to JSON. Unlike
+// datatypes.JSON, json.RawMessage has no gorm-awareness at all -- it's
+// plain []byte to gorm's own classification, which would otherwise
+// silently resolve it to Bytes (a valid but semantically wrong column
+// type, not an error) rather than something that flags the mismatch.
+var rawMessageType = reflect.TypeFor[json.RawMessage]()
+
+// datatypesJSONType identifies a gorm.io/datatypes.JSON field the same
+// way rawMessageType identifies json.RawMessage -- a direct concrete
+// type comparison against IndirectFieldType, rather than matching on
+// the "json" string its GormDataType() method happens to return (gorm
+// still resolves that field's schema.Field.DataType to that string
+// internally; this package just doesn't rely on it).
+var datatypesJSONType = reflect.TypeFor[datatypes.JSON]()
 
 // schemaCache lets repeated TypeOf calls against the same model reuse
 // gorm's parsed schema instead of re-parsing every time.
@@ -26,6 +46,7 @@ const (
 	ParamDecimal
 	ParamFloat
 	ParamBytes
+	ParamJSON
 	ParamRaw // Raw holds the literal SQL type name to emit verbatim
 )
 
@@ -49,6 +70,14 @@ var (
 	Time  = ParamType{Kind: ParamTime}
 	Float = ParamType{Kind: ParamFloat}
 	Bytes = ParamType{Kind: ParamBytes}
+	// JSON renders as Postgres JSONB (the idiomatic default -- indexable,
+	// supports containment operators; use Raw("JSON") instead if the
+	// rare need to preserve exact key order/whitespace applies), MySQL's
+	// native JSON, and SQL Server's NVARCHAR(MAX) -- SQL Server has no
+	// native JSON type at all, storing and querying it (ISJSON,
+	// JSON_VALUE, ...) over nvarchar the same way Microsoft's own docs
+	// do.
+	JSON = ParamType{Kind: ParamJSON}
 )
 
 // Varchar/Char are sized-string variants, Decimal is fixed-precision
@@ -72,18 +101,21 @@ func Raw(sqlType string) ParamType { return ParamType{Kind: ParamRaw, Raw: sqlTy
 // TypeOf derives a ParamType from an existing model field, so the
 // param's type tracks the column instead of drifting if it changes
 // later. field is the Go struct field name (e.g. "ID"), not the DB
-// column name. Errors (surfaced at Build()) whenever gorm's own field
-// classification doesn't map to this package's small portable set --
-// besides Uint (see its own case below), that also includes a
-// relation/association field (schema.Field.DataType is left empty for
-// those -- there's no single scalar column to type; target the FK
-// field directly instead, e.g. "UserID" rather than "User") and a
-// field whose type implements gorm's own GormDataTypeInterface (e.g.
-// datatypes.JSON, which resolves to DataType("json")) -- gorm's string
-// there is real semantic information, but it isn't a SQL keyword on
-// every engine (SQL Server has no native JSON type at all), so it's
-// deliberately not auto-forwarded into Raw() for the caller; use Raw()
-// explicitly with the right spelling for the engine being targeted.
+// column name. Recognizes JSON two ways, both by exact concrete type
+// rather than gorm's GormDataTypeInterface string: gorm.io/datatypes.JSON
+// and json.RawMessage. Neither would otherwise map cleanly -- gorm
+// resolves datatypes.JSON's schema.Field.DataType to the custom string
+// "json" (not one of this package's own kinds), and json.RawMessage
+// (stdlib, no gorm-awareness at all) resolves to plain Bytes, a valid
+// but semantically wrong column type, not an error. Errors (surfaced at
+// Build()) whenever gorm's own field classification doesn't map to this
+// package's small portable set otherwise -- besides Uint (see its own
+// case below), that also includes a relation/association field
+// (schema.Field.DataType is left empty for those -- there's no single
+// scalar column to type; target the FK field directly instead, e.g.
+// "UserID" rather than "User") and any other custom gorm data type or
+// array type; use Raw() explicitly with the right spelling for the
+// engine being targeted.
 func TypeOf(model any, field string) ParamType {
 	sc, err := schema.Parse(model, schemaCache, schema.NamingStrategy{})
 	if err != nil {
@@ -92,6 +124,9 @@ func TypeOf(model any, field string) ParamType {
 	f := sc.LookUpField(field)
 	if f == nil {
 		return ParamType{err: fmt.Errorf("procedure: TypeOf: field %q not found on table %q", field, sc.Table)}
+	}
+	if f.IndirectFieldType == datatypesJSONType || f.IndirectFieldType == rawMessageType {
+		return JSON
 	}
 	switch f.DataType {
 	case schema.Bool:
@@ -109,7 +144,7 @@ func TypeOf(model any, field string) ParamType {
 	case schema.Uint:
 		return ParamType{err: fmt.Errorf("procedure: TypeOf: field %q is Uint, which has no portable equivalent (Postgres and SQL Server have no native unsigned integer type) -- use Raw() directly for it", field)}
 	default:
-		return ParamType{err: fmt.Errorf("procedure: TypeOf: field %q has no portable equivalent -- this includes relation/association fields (target the FK field directly instead) and types with a custom gorm data type like datatypes.JSON or an array type (use Raw() directly, with the right spelling for the engine being targeted)", field)}
+		return ParamType{err: fmt.Errorf("procedure: TypeOf: field %q has no portable equivalent -- this includes relation/association fields (target the FK field directly instead) and types with a custom gorm data type (other than datatypes.JSON) or an array type (use Raw() directly, with the right spelling for the engine being targeted)", field)}
 	}
 }
 
