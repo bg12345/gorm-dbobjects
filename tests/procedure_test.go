@@ -59,6 +59,61 @@ func TestProcedure_Param_DuplicateName_Errors(t *testing.T) {
 	}
 }
 
+// TestProcedure_Params confirms Params adds multiple params in one
+// call, preserving declaration order -- load-bearing, since a
+// procedure's params are positional (CALL/EXEC binds by declaration
+// order), unlike a map-based batch method (see Params' own doc
+// comment for why that shape was rejected).
+func TestProcedure_Params(t *testing.T) {
+	def, err := procedure.New("sp_multi").
+		Params(
+			procedure.Param{Name: "user_id", Type: procedure.Int},
+			procedure.Param{Name: "new_name", Type: procedure.Varchar(100)},
+			procedure.Param{Name: "active", Type: procedure.Bool},
+		).
+		Body("SELECT 1;").
+		Build()
+	if err != nil {
+		t.Fatalf("Build() error = %v", err)
+	}
+	want := []string{"user_id", "new_name", "active"}
+	if len(def.Params) != len(want) {
+		t.Fatalf("len(Params) = %d, want %d", len(def.Params), len(want))
+	}
+	for i, name := range want {
+		if def.Params[i].Name != name {
+			t.Errorf("Params[%d].Name = %q, want %q (order should match declaration)", i, def.Params[i].Name, name)
+		}
+	}
+}
+
+func TestProcedure_Params_DuplicateName_Errors(t *testing.T) {
+	_, err := procedure.New("p").
+		Params(
+			procedure.Param{Name: "user_id", Type: procedure.Int},
+			procedure.Param{Name: "user_id", Type: procedure.Text},
+		).
+		Body("SELECT 1;").
+		Build()
+	if err == nil {
+		t.Fatal("Build() error = nil, want error for a duplicate param name")
+	}
+}
+
+// TestProcedure_Params_MixedWithParam confirms Params and the
+// single-param Param can be chained together, and duplicate detection
+// still applies across both.
+func TestProcedure_Params_MixedWithParam(t *testing.T) {
+	_, err := procedure.New("p").
+		Param("user_id", procedure.Int).
+		Params(procedure.Param{Name: "user_id", Type: procedure.Text}).
+		Body("SELECT 1;").
+		Build()
+	if err == nil {
+		t.Fatal("Build() error = nil, want error for a name Param() already used, added again via Params()")
+	}
+}
+
 func TestProcedure_Kind(t *testing.T) {
 	if got := procedure.New("p").Kind(); got != "procedure" {
 		t.Errorf("Kind() = %q, want %q", got, "procedure")
@@ -153,8 +208,10 @@ func TestRegister_Postgres_AppliesProcedure(t *testing.T) {
 
 	client := dbobjects.NewClient(db)
 	proc := procedure.New("sp_set_user_name_pg").
-		Param("user_id", procedure.Int).
-		Param("new_name", procedure.Varchar(100)).
+		Params(
+			procedure.Param{Name: "user_id", Type: procedure.Int},
+			procedure.Param{Name: "new_name", Type: procedure.Varchar(100)},
+		).
 		Body("UPDATE user_master SET name = new_name WHERE id = user_id;")
 	if err := client.Register(context.Background(), proc); err != nil {
 		t.Fatalf("Register: %v", err)
@@ -246,8 +303,10 @@ func TestRegister_MySQL_AppliesProcedure(t *testing.T) {
 
 	client := dbobjects.NewClient(db)
 	proc := procedure.New("sp_set_user_name_mysql").
-		Param("user_id", procedure.Int).
-		Param("new_name", procedure.Varchar(100)).
+		Params(
+			procedure.Param{Name: "user_id", Type: procedure.Int},
+			procedure.Param{Name: "new_name", Type: procedure.Varchar(100)},
+		).
 		Body("UPDATE user_master SET name = new_name WHERE id = user_id;")
 	if err := client.Register(context.Background(), proc); err != nil {
 		t.Fatalf("Register: %v", err)
@@ -322,8 +381,10 @@ func TestRegister_SQLServer_AppliesProcedure(t *testing.T) {
 
 	client := dbobjects.NewClient(db)
 	proc := procedure.New("sp_set_user_name_mssql").
-		Param("user_id", procedure.Int).
-		Param("new_name", procedure.Varchar(100)).
+		Params(
+			procedure.Param{Name: "user_id", Type: procedure.Int},
+			procedure.Param{Name: "new_name", Type: procedure.Varchar(100)},
+		).
 		Body("UPDATE user_master SET name = @new_name WHERE id = @user_id;")
 	if err := client.Register(context.Background(), proc); err != nil {
 		t.Fatalf("Register: %v", err)

@@ -182,6 +182,20 @@ model field so it tracks the column instead of drifting if the column's
 type changes later. Not supported on SQLite, which has no stored
 procedure concept at all.
 
+For more than one or two params, `Params` takes them all at once
+instead of chaining `Param` repeatedly — a slice, not a map, since a
+procedure's params are positional (`CALL`/`EXEC` binds arguments by
+declaration order):
+
+```go
+proc := procedure.New("sp_set_user_name").
+    Params(
+        procedure.Param{Name: "user_id", Type: procedure.Int},
+        procedure.Param{Name: "new_name", Type: procedure.Varchar(100)},
+    ).
+    Body("UPDATE user_master SET name = new_name WHERE id = user_id;")
+```
+
 ## How it's built
 
 Each object kind (`trigger`, `view`, and eventually `procedure`) is its

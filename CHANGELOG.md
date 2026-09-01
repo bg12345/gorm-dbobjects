@@ -8,7 +8,10 @@ are release-tag dates.
 
 ### Added
 - Stored procedures on Postgres, MySQL, and SQL Server —
-  `procedure.New(name).Param(...).Body(...)`. `dbobjects` generates the
+  `procedure.New(name).Param(...).Body(...)`, or `Params(...)` to add
+  several at once (a variadic slice, not a map — a procedure's params
+  are positional, unlike a trigger's order-independent `SET` clause).
+  `dbobjects` generates the
   signature/wrapper ceremony per engine (`CREATE OR REPLACE PROCEDURE`,
   `DROP IF EXISTS` + `CREATE`, `CREATE OR ALTER PROCEDURE`); the body
   itself stays a single caller-authored SQL string, since control flow

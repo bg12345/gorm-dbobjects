@@ -166,6 +166,7 @@ type Definition struct {
 type Procedure interface {
 	Kind() string
 	Param(name string, t ParamType) Procedure
+	Params(params ...Param) Procedure
 	Body(sql string) Procedure
 	Build() (*Definition, error)
 }
@@ -196,6 +197,19 @@ func (p *procedureBuilder) Param(name string, t ParamType) Procedure {
 	}
 	p.seen[name] = true
 	p.params = append(p.params, Param{Name: name, Type: t})
+	return p
+}
+
+// Params adds multiple params at once, in the order given -- a slice,
+// not a map, since a procedure's params are positional (CALL/EXEC binds
+// arguments by declaration order), unlike trigger.SetColumns' SET
+// clause where column order carries no meaning; a map here would
+// silently reorder the signature between runs. Delegates to Param so
+// duplicate-name detection stays in one place.
+func (p *procedureBuilder) Params(params ...Param) Procedure {
+	for _, param := range params {
+		p.Param(param.Name, param.Type)
+	}
 	return p
 }
 
