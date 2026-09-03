@@ -6,6 +6,8 @@ are release-tag dates.
 
 ## [Unreleased]
 
+## [v0.6.0] - 2026-09-03
+
 ### Added
 - Stored procedures on Postgres, MySQL, and SQL Server —
   `procedure.New(name).Param(...).Body(...)`, or `Params(...)` to add
