@@ -8,6 +8,7 @@ import (
 	"strings"
 	"time"
 
+	"github.com/bg12345/gorm-dbobjects/procedure"
 	"github.com/bg12345/gorm-dbobjects/trigger"
 	"github.com/bg12345/gorm-dbobjects/view"
 	"gorm.io/gorm"
@@ -103,6 +104,25 @@ func (c *Client) resolveDDL(d dialect, obj DBObject, op ddlOp) (stmts []string, 
 			stmts, err = vd.renderViewDeclarative(c.db, def)
 		default:
 			stmts, err = vd.renderView(c.db, def)
+		}
+		return stmts, desc, def.Name, err
+	case procedure.Procedure:
+		def, err := o.Build()
+		if err != nil {
+			return nil, "", "", err
+		}
+		pd, ok := d.(procedureDialect)
+		if !ok {
+			return nil, "", "", fmt.Errorf("dbobjects: dialect %q does not support procedures", d.Name())
+		}
+		desc = fmt.Sprintf("procedure %q", def.Name)
+		switch op {
+		case opDrop:
+			stmts, err = pd.dropProcedure(def)
+		case opRenderDeclarative:
+			stmts, err = pd.renderProcedureDeclarative(def)
+		default:
+			stmts, err = pd.renderProcedure(def)
 		}
 		return stmts, desc, def.Name, err
 	default:

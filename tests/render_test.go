@@ -9,6 +9,7 @@ import (
 
 	dbobjects "github.com/bg12345/gorm-dbobjects"
 	"github.com/bg12345/gorm-dbobjects/internal/testutil"
+	"github.com/bg12345/gorm-dbobjects/procedure"
 	"github.com/bg12345/gorm-dbobjects/trigger"
 	"github.com/bg12345/gorm-dbobjects/view"
 	"gorm.io/gorm"
@@ -325,5 +326,126 @@ func TestRender_Declarative_View_SQLite_IsValidDDL(t *testing.T) {
 	}
 	if len(rows) != 1 {
 		t.Fatalf("view returned %d row(s), want 1: %+v", len(rows), rows)
+	}
+}
+
+// TestRender_Declarative_Procedure_Postgres_IsValidDDL is the procedure
+// equivalent of TestRender_Declarative_Postgres_IsValidDDL.
+func TestRender_Declarative_Procedure_Postgres_IsValidDDL(t *testing.T) {
+	db, err := testutil.NewPostgres()
+	if err != nil {
+		t.Skipf("skipping integration test, no Postgres reachable: %v", err)
+	}
+
+	client := dbobjects.NewClient(db)
+	proc := procedure.New("sp_render_declarative_pg_test").
+		Param("x", procedure.Int).
+		Body("SELECT x;")
+
+	stmts, err := client.Render(dbobjects.Declarative, proc)
+	if err != nil {
+		t.Fatalf("Render: %v", err)
+	}
+	if len(stmts) != 1 {
+		t.Fatalf("Render() returned %d object(s), want 1", len(stmts))
+	}
+	sql := stmts[0]
+	if strings.Contains(sql, "OR REPLACE") {
+		t.Errorf("Declarative output should not contain OR REPLACE, got:\n%s", sql)
+	}
+
+	t.Cleanup(func() { _ = client.Drop(context.Background(), proc) })
+	_ = client.Drop(context.Background(), proc)
+
+	if err := db.Exec(sql).Error; err != nil {
+		t.Fatalf("executing declarative statement failed (not valid DDL):\n%s\nerror: %v", sql, err)
+	}
+
+	var count int64
+	if err := db.Raw(`SELECT count(*) FROM pg_proc WHERE proname = ?`, "sp_render_declarative_pg_test").
+		Scan(&count).Error; err != nil {
+		t.Fatalf("querying pg_proc: %v", err)
+	}
+	if count != 1 {
+		t.Errorf("pg_proc rows named sp_render_declarative_pg_test = %d, want 1 (declarative DDL should have created it)", count)
+	}
+}
+
+// TestRender_Declarative_Procedure_MySQL_IsValidDDL is the MySQL
+// equivalent of TestRender_Declarative_Procedure_Postgres_IsValidDDL.
+func TestRender_Declarative_Procedure_MySQL_IsValidDDL(t *testing.T) {
+	db, err := testutil.NewMySQL()
+	if err != nil {
+		t.Skipf("skipping integration test, no MySQL reachable: %v", err)
+	}
+
+	client := dbobjects.NewClient(db)
+	proc := procedure.New("sp_render_declarative_mysql_test").
+		Param("x", procedure.Int).
+		Body("SELECT x;")
+
+	stmts, err := client.Render(dbobjects.Declarative, proc)
+	if err != nil {
+		t.Fatalf("Render: %v", err)
+	}
+	if len(stmts) != 1 {
+		t.Fatalf("Render() returned %d object(s), want 1 (no DROP)", len(stmts))
+	}
+
+	t.Cleanup(func() { _ = client.Drop(context.Background(), proc) })
+	_ = client.Drop(context.Background(), proc)
+
+	if err := db.Exec(stmts[0]).Error; err != nil {
+		t.Fatalf("executing declarative statement failed (not valid DDL):\n%s\nerror: %v", stmts[0], err)
+	}
+
+	var count int64
+	if err := db.Raw(`SELECT count(*) FROM information_schema.routines WHERE routine_name = ? AND routine_type = 'PROCEDURE'`,
+		"sp_render_declarative_mysql_test").Scan(&count).Error; err != nil {
+		t.Fatalf("querying information_schema.routines: %v", err)
+	}
+	if count != 1 {
+		t.Errorf("procedures named sp_render_declarative_mysql_test = %d, want 1 (declarative DDL should have created it)", count)
+	}
+}
+
+// TestRender_Declarative_Procedure_SQLServer_IsValidDDL is the SQL
+// Server equivalent of TestRender_Declarative_Procedure_Postgres_IsValidDDL.
+func TestRender_Declarative_Procedure_SQLServer_IsValidDDL(t *testing.T) {
+	db, err := testutil.NewSQLServer()
+	if err != nil {
+		t.Skipf("skipping integration test, no SQL Server reachable: %v", err)
+	}
+
+	client := dbobjects.NewClient(db)
+	proc := procedure.New("sp_render_declarative_mssql_test").
+		Param("x", procedure.Int).
+		Body("SELECT @x;")
+
+	stmts, err := client.Render(dbobjects.Declarative, proc)
+	if err != nil {
+		t.Fatalf("Render: %v", err)
+	}
+	if len(stmts) != 1 {
+		t.Fatalf("Render() returned %d object(s), want 1", len(stmts))
+	}
+	if strings.Contains(stmts[0], "OR ALTER") {
+		t.Errorf("Declarative output should not contain OR ALTER, got:\n%s", stmts[0])
+	}
+
+	t.Cleanup(func() { _ = client.Drop(context.Background(), proc) })
+	_ = client.Drop(context.Background(), proc)
+
+	if err := db.Exec(stmts[0]).Error; err != nil {
+		t.Fatalf("executing declarative statement failed (not valid DDL):\n%s\nerror: %v", stmts[0], err)
+	}
+
+	var count int64
+	if err := db.Raw(`SELECT count(*) FROM sys.procedures WHERE name = ?`, "sp_render_declarative_mssql_test").
+		Scan(&count).Error; err != nil {
+		t.Fatalf("querying sys.procedures: %v", err)
+	}
+	if count != 1 {
+		t.Errorf("sys.procedures rows named sp_render_declarative_mssql_test = %d, want 1 (declarative DDL should have created it)", count)
 	}
 }

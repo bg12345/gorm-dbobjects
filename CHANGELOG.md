@@ -6,6 +6,35 @@ are release-tag dates.
 
 ## [Unreleased]
 
+## [v0.6.0] - 2026-09-03
+
+### Added
+- Stored procedures on Postgres, MySQL, and SQL Server —
+  `procedure.New(name).Param(...).Body(...)`, or `Params(...)` to add
+  several at once (a variadic slice, not a map — a procedure's params
+  are positional, unlike a trigger's order-independent `SET` clause).
+  `dbobjects` generates the
+  signature/wrapper ceremony per engine (`CREATE OR REPLACE PROCEDURE`,
+  `DROP IF EXISTS` + `CREATE`, `CREATE OR ALTER PROCEDURE`); the body
+  itself stays a single caller-authored SQL string, since control flow
+  (loops, cursors, exception handling) can't be abstracted portably the
+  way a trigger's flat column assignment can. `Param` types are a small
+  portable set (`Int`/`Text`/`Bool`/`Time`/`Varchar(n)`/`Char(n)`/
+  `Decimal(p,s)`/`Float`/`Bytes`/`JSON`), a `Raw(sqlType)` escape hatch,
+  or `TypeOf(&Model{}, "Field")` deriving one from an existing gorm
+  field — including recognizing `gorm.io/datatypes.JSON` fields (a real
+  dependency now, matched by exact type) and `json.RawMessage`
+  specifically as `JSON` (renders as Postgres `JSONB`, MySQL's native
+  `JSON`, SQL Server's `NVARCHAR(MAX)` — no native JSON type there at
+  all; `json.RawMessage` needed its own case since it's plain `[]byte`
+  to gorm with no gorm-awareness, which would otherwise silently
+  resolve to `Bytes` instead). Errors
+  for a `Uint` field specifically — Postgres/SQL Server have no native
+  unsigned integer type at all. Not supported on
+  SQLite, which has no stored procedure concept at all — rejected via
+  the same dialect-capability mechanism trigger/view already use, no
+  SQLite-specific code needed.
+
 ## [v0.5.0] - 2026-08-31
 
 ### Added

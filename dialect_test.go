@@ -4,6 +4,7 @@ import (
 	"strings"
 	"testing"
 
+	"github.com/bg12345/gorm-dbobjects/procedure"
 	"github.com/bg12345/gorm-dbobjects/trigger"
 	"github.com/bg12345/gorm-dbobjects/view"
 )
@@ -1108,4 +1109,307 @@ func TestSQLServerDialect_DropView(t *testing.T) {
 	if want := "DROP VIEW IF EXISTS active_users;"; stmts[0] != want {
 		t.Errorf("dropView()[0] = %q, want %q", stmts[0], want)
 	}
+}
+
+// --- procedure ---
+
+func TestPostgresDialect_ParamType(t *testing.T) {
+	d := postgresDialect{}
+	tests := []struct {
+		name string
+		in   procedure.ParamType
+		want string
+	}{
+		{"Int", procedure.Int, "INT"},
+		{"Text", procedure.Text, "TEXT"},
+		{"Bool", procedure.Bool, "BOOLEAN"},
+		{"Time", procedure.Time, "TIMESTAMP"},
+		{"Varchar", procedure.Varchar(50), "VARCHAR(50)"},
+		{"Char", procedure.Char(10), "CHAR(10)"},
+		{"Decimal", procedure.Decimal(10, 2), "DECIMAL(10,2)"},
+		{"Float", procedure.Float, "DOUBLE PRECISION"},
+		{"Bytes", procedure.Bytes, "BYTEA"},
+		{"JSON", procedure.JSON, "JSONB"},
+		{"Raw", procedure.Raw("JSONB"), "JSONB"},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			got, err := d.paramType(tt.in)
+			if err != nil {
+				t.Fatalf("paramType(%+v) error = %v", tt.in, err)
+			}
+			if got != tt.want {
+				t.Errorf("paramType(%+v) = %q, want %q", tt.in, got, tt.want)
+			}
+		})
+	}
+}
+
+func TestPostgresDialect_ParamType_InvalidSize_Errors(t *testing.T) {
+	d := postgresDialect{}
+	tests := []procedure.ParamType{procedure.Varchar(0), procedure.Char(-1), procedure.Decimal(0, 0), procedure.Decimal(5, 6)}
+	for _, in := range tests {
+		if _, err := d.paramType(in); err == nil {
+			t.Errorf("paramType(%+v) error = nil, want error", in)
+		}
+	}
+}
+
+func TestPostgresDialect_RenderProcedure_StatementShape(t *testing.T) {
+	def := &procedure.Definition{
+		Name:   "recalc_balances",
+		Params: []procedure.Param{{Name: "user_id", Type: procedure.Int}},
+		Body:   "UPDATE accounts SET balance = balance + 1 WHERE id = user_id;",
+	}
+
+	stmts, err := postgresDialect{}.renderProcedure(def)
+	if err != nil {
+		t.Fatalf("renderProcedure() error = %v", err)
+	}
+	want := []string{`CREATE OR REPLACE PROCEDURE recalc_balances(user_id INT) LANGUAGE plpgsql AS $$
+BEGIN
+  UPDATE accounts SET balance = balance + 1 WHERE id = user_id;
+END;
+$$;`}
+	if !slicesEqual(stmts, want) {
+		t.Errorf("renderProcedure() = %q, want %q", stmts, want)
+	}
+}
+
+func TestPostgresDialect_RenderProcedureDeclarative_BodyMatchesIdempotent(t *testing.T) {
+	def := &procedure.Definition{
+		Name:   "recalc_balances",
+		Params: []procedure.Param{{Name: "user_id", Type: procedure.Int}},
+		Body:   "UPDATE accounts SET balance = balance + 1 WHERE id = user_id;",
+	}
+
+	idempotent, err := postgresDialect{}.renderProcedure(def)
+	if err != nil {
+		t.Fatalf("renderProcedure() error = %v", err)
+	}
+	declarative, err := postgresDialect{}.renderProcedureDeclarative(def)
+	if err != nil {
+		t.Fatalf("renderProcedureDeclarative() error = %v", err)
+	}
+	if strings.Contains(declarative[0], "OR REPLACE") {
+		t.Errorf("renderProcedureDeclarative() should not contain OR REPLACE, got:\n%s", declarative[0])
+	}
+	for _, want := range []string{"user_id INT", "UPDATE accounts SET balance = balance + 1 WHERE id = user_id;"} {
+		if !strings.Contains(idempotent[0], want) {
+			t.Fatalf("test setup: renderProcedure() missing %q, got:\n%s", want, idempotent[0])
+		}
+		if !strings.Contains(declarative[0], want) {
+			t.Errorf("renderProcedureDeclarative() diverged from renderProcedure(): missing %q, got:\n%s", want, declarative[0])
+		}
+	}
+}
+
+func TestPostgresDialect_DropProcedure_StatementShape(t *testing.T) {
+	def := &procedure.Definition{Name: "recalc_balances"}
+	stmts, err := postgresDialect{}.dropProcedure(def)
+	if err != nil {
+		t.Fatalf("dropProcedure() error = %v", err)
+	}
+	if want := "DROP PROCEDURE IF EXISTS recalc_balances;"; len(stmts) != 1 || stmts[0] != want {
+		t.Errorf("dropProcedure() = %q, want [%q]", stmts, want)
+	}
+}
+
+func TestMySQLDialect_ParamType(t *testing.T) {
+	d := mysqlDialect{}
+	tests := []struct {
+		name string
+		in   procedure.ParamType
+		want string
+	}{
+		{"Time", procedure.Time, "DATETIME"},
+		{"Float", procedure.Float, "DOUBLE"},
+		{"Bytes", procedure.Bytes, "BLOB"},
+		{"JSON", procedure.JSON, "JSON"},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			got, err := d.paramType(tt.in)
+			if err != nil {
+				t.Fatalf("paramType(%+v) error = %v", tt.in, err)
+			}
+			if got != tt.want {
+				t.Errorf("paramType(%+v) = %q, want %q", tt.in, got, tt.want)
+			}
+		})
+	}
+}
+
+func TestMySQLDialect_RenderProcedure_StatementShape_NoParams(t *testing.T) {
+	def := &procedure.Definition{
+		Name: "reset_counters",
+		Body: "UPDATE counters SET value = 0;",
+	}
+
+	stmts, err := mysqlDialect{}.renderProcedure(def)
+	if err != nil {
+		t.Fatalf("renderProcedure() error = %v", err)
+	}
+	want := []string{
+		`DROP PROCEDURE IF EXISTS reset_counters;`,
+		`CREATE PROCEDURE reset_counters() BEGIN
+  UPDATE counters SET value = 0;
+END`,
+	}
+	if !slicesEqual(stmts, want) {
+		t.Errorf("renderProcedure() = %q, want %q", stmts, want)
+	}
+}
+
+func TestMySQLDialect_RenderProcedure_ParamCeremony(t *testing.T) {
+	def := &procedure.Definition{
+		Name:   "sp_set_user_name",
+		Params: []procedure.Param{{Name: "user_id", Type: procedure.Int}, {Name: "new_name", Type: procedure.Varchar(100)}},
+		Body:   "UPDATE user_master SET name = new_name WHERE id = user_id;",
+	}
+
+	stmts, err := mysqlDialect{}.renderProcedure(def)
+	if err != nil {
+		t.Fatalf("renderProcedure() error = %v", err)
+	}
+	if want := "IN user_id INT, IN new_name VARCHAR(100)"; !strings.Contains(stmts[1], want) {
+		t.Errorf("renderProcedure() missing param ceremony %q, got:\n%s", want, stmts[1])
+	}
+}
+
+func TestMySQLDialect_RenderProcedureDeclarative_BodyMatchesIdempotent(t *testing.T) {
+	def := &procedure.Definition{
+		Name:   "sp_set_user_name",
+		Params: []procedure.Param{{Name: "user_id", Type: procedure.Int}},
+		Body:   "UPDATE user_master SET name = 'x' WHERE id = user_id;",
+	}
+
+	idempotent, err := mysqlDialect{}.renderProcedure(def)
+	if err != nil {
+		t.Fatalf("renderProcedure() error = %v", err)
+	}
+	declarative, err := mysqlDialect{}.renderProcedureDeclarative(def)
+	if err != nil {
+		t.Fatalf("renderProcedureDeclarative() error = %v", err)
+	}
+	if len(declarative) != 1 {
+		t.Fatalf("renderProcedureDeclarative() returned %d statement(s), want 1 (no DROP)", len(declarative))
+	}
+	if declarative[0] != idempotent[1] {
+		t.Errorf("renderProcedureDeclarative()[0] diverged from renderProcedure()'s CREATE statement:\ngot:  %s\nwant: %s", declarative[0], idempotent[1])
+	}
+}
+
+func TestMySQLDialect_DropProcedure_StatementShape(t *testing.T) {
+	def := &procedure.Definition{Name: "sp_set_user_name"}
+	stmts, err := mysqlDialect{}.dropProcedure(def)
+	if err != nil {
+		t.Fatalf("dropProcedure() error = %v", err)
+	}
+	if want := "DROP PROCEDURE IF EXISTS sp_set_user_name;"; len(stmts) != 1 || stmts[0] != want {
+		t.Errorf("dropProcedure() = %q, want [%q]", stmts, want)
+	}
+}
+
+func TestSQLServerDialect_ParamType(t *testing.T) {
+	d := sqlServerDialect{}
+	tests := []struct {
+		name string
+		in   procedure.ParamType
+		want string
+	}{
+		{"Text", procedure.Text, "NVARCHAR(MAX)"},
+		{"Bool", procedure.Bool, "BIT"},
+		{"Time", procedure.Time, "DATETIME2"},
+		{"Varchar", procedure.Varchar(50), "NVARCHAR(50)"},
+		{"Char", procedure.Char(10), "NCHAR(10)"},
+		{"Float", procedure.Float, "FLOAT"},
+		{"Bytes", procedure.Bytes, "VARBINARY(MAX)"},
+		{"JSON", procedure.JSON, "NVARCHAR(MAX)"},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			got, err := d.paramType(tt.in)
+			if err != nil {
+				t.Fatalf("paramType(%+v) error = %v", tt.in, err)
+			}
+			if got != tt.want {
+				t.Errorf("paramType(%+v) = %q, want %q", tt.in, got, tt.want)
+			}
+		})
+	}
+}
+
+func TestSQLServerDialect_RenderProcedure_StatementShape(t *testing.T) {
+	def := &procedure.Definition{
+		Name:   "sp_set_user_name",
+		Params: []procedure.Param{{Name: "user_id", Type: procedure.Int}, {Name: "new_name", Type: procedure.Varchar(100)}},
+		Body:   "UPDATE user_master SET name = @new_name WHERE id = @user_id;",
+	}
+
+	stmts, err := sqlServerDialect{}.renderProcedure(def)
+	if err != nil {
+		t.Fatalf("renderProcedure() error = %v", err)
+	}
+	want := []string{`CREATE OR ALTER PROCEDURE sp_set_user_name @user_id INT, @new_name NVARCHAR(100) AS
+BEGIN
+  UPDATE user_master SET name = @new_name WHERE id = @user_id;
+END;`}
+	if !slicesEqual(stmts, want) {
+		t.Errorf("renderProcedure() = %q, want %q", stmts, want)
+	}
+}
+
+func TestSQLServerDialect_RenderProcedureDeclarative_StatementShape(t *testing.T) {
+	def := &procedure.Definition{
+		Name:   "sp_set_user_name",
+		Params: []procedure.Param{{Name: "user_id", Type: procedure.Int}},
+		Body:   "UPDATE user_master SET id = @user_id;",
+	}
+
+	stmts, err := sqlServerDialect{}.renderProcedureDeclarative(def)
+	if err != nil {
+		t.Fatalf("renderProcedureDeclarative() error = %v", err)
+	}
+	if len(stmts) != 1 || strings.Contains(stmts[0], "OR ALTER") {
+		t.Errorf("renderProcedureDeclarative() should be a single statement with no OR ALTER, got:\n%s", strings.Join(stmts, "\n---\n"))
+	}
+}
+
+func TestSQLServerDialect_DropProcedure_StatementShape(t *testing.T) {
+	def := &procedure.Definition{Name: "sp_set_user_name"}
+	stmts, err := sqlServerDialect{}.dropProcedure(def)
+	if err != nil {
+		t.Fatalf("dropProcedure() error = %v", err)
+	}
+	if want := "DROP PROCEDURE IF EXISTS sp_set_user_name;"; len(stmts) != 1 || stmts[0] != want {
+		t.Errorf("dropProcedure() = %q, want [%q]", stmts, want)
+	}
+}
+
+// TestResolveDDL_SQLite_RejectsProcedure confirms SQLite -- which has no
+// stored procedure concept at all -- is rejected via resolveDDL's own
+// dialect-capability check, the same mechanism trigger/view already use,
+// rather than needing any SQLite-specific procedure code.
+func TestResolveDDL_SQLite_RejectsProcedure(t *testing.T) {
+	proc := procedure.New("noop").Body("SELECT 1;")
+	client := &Client{}
+	if _, _, _, err := client.resolveDDL(sqliteDialect{}, proc, opRender); err == nil {
+		t.Fatal("resolveDDL() error = nil, want error: sqlite has no procedure support")
+	}
+}
+
+// slicesEqual is a tiny local helper -- this file predates slices.Equal
+// being reached for elsewhere in the codebase, and pulling in a new
+// import for one comparison isn't worth it.
+func slicesEqual(a, b []string) bool {
+	if len(a) != len(b) {
+		return false
+	}
+	for i := range a {
+		if a[i] != b[i] {
+			return false
+		}
+	}
+	return true
 }

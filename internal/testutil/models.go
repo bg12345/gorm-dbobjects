@@ -1,6 +1,11 @@
 package testutil
 
-import "gorm.io/gorm"
+import (
+	"encoding/json"
+
+	"gorm.io/datatypes"
+	"gorm.io/gorm"
+)
 
 type UserMaster struct {
 	gorm.Model `json:"-"`
@@ -22,5 +27,15 @@ type UserMasterLogs struct{
 
 func (UserMasterLogs) TableName() string {
 	return "user_master_logs"
+}
+
+type JSONData struct {
+	gorm.Model `json:"-"`
+	Data datatypes.JSON `gorm:"type:json;not null" json:"data"`
+	Raw json.RawMessage `gorm:"type:json;not null" json:"raw"`
+}
+
+func (JSONData) TableName() string {
+	return "json_data"
 }
 
