@@ -1,3 +1,21 @@
+// Package dbobjects manages database-side objects -- triggers, views,
+// and stored procedures -- as type-checked Go code on top of gorm,
+// across multiple database engines (Postgres, MySQL, SQLite, SQL
+// Server).
+//
+// Build a trigger, view, or procedure with that kind's own fluent
+// builder (the trigger, view, or procedure package), then apply it
+// against a connected *gorm.DB through a Client:
+//
+//	client := dbobjects.NewClient(db)
+//	tr := trigger.BeforeUpdate(&User{}).Set("updated_at", trigger.Now())
+//	err := client.Register(ctx, tr)
+//
+// Register/Drop apply the generated DDL directly -- the right fit for
+// local development, tests, and CI, or projects with no separate
+// migration tool. Render returns the same DDL as plain strings without
+// touching the database, for feeding an external-schema source like
+// Atlas instead.
 package dbobjects
 
 import (

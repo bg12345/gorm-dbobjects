@@ -6,6 +6,18 @@ are release-tag dates.
 
 ## [Unreleased]
 
+### Added
+- Package-level doc comments for `dbobjects`, `trigger`, `view`, and
+  `procedure` — previously blank on pkg.go.dev's package pages.
+- Runnable `Example` functions: `trigger`/`view`/`procedure` each get a
+  real, executed example (their `Build()` needs no DB connection, so
+  these carry a genuine `// Output:` assertion, not just sample code);
+  the root `dbobjects` package's example is compile-checked only, since
+  `Register`/`Render` need a live connection to actually run.
+
+First step of the pre-`v1.0.0` stability pass (no functional/API
+changes) — see `docs/PLAN.md` §7.
+
 ## [v0.6.0] - 2026-09-03
 
 ### Added

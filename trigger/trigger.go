@@ -1,3 +1,15 @@
+// Package trigger builds database triggers as type-checked Go values,
+// independent of any SQL dialect. BeforeInsert/BeforeUpdate/
+// BeforeDelete/AfterInsert/AfterUpdate/AfterDelete start a trigger on a
+// gorm model; Set/SetColumns assign NEW columns, validated against the
+// model's real gorm schema at Build time, and Body supplies raw SQL for
+// anything Set can't express -- required for DELETE triggers, since
+// there's no NEW row to assign into.
+//
+//	tr := trigger.BeforeUpdate(&User{}).Set("updated_at", trigger.Now())
+//
+// A built Definition is dialect-agnostic; github.com/bg12345/gorm-dbobjects's
+// Client resolves it to the connected engine's actual DDL.
 package trigger
 
 import (
