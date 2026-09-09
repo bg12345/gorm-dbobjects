@@ -1,3 +1,15 @@
+// Package view builds database views as type-checked Go values, built
+// from a gorm query callback so the same definition renders correctly
+// per engine, with a Raw escape hatch for queries gorm's builder can't
+// express.
+//
+//	v := view.New("active_users").
+//		Query(func(tx *gorm.DB) *gorm.DB {
+//			return tx.Model(&User{}).Where("active = ?", true)
+//		})
+//
+// A built Definition is dialect-agnostic; github.com/bg12345/gorm-dbobjects's
+// Client resolves it to the connected engine's actual DDL.
 package view
 
 import (

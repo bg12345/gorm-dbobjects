@@ -1,3 +1,16 @@
+// Package procedure builds stored procedures as type-checked Go
+// values. Unlike trigger, there's no Set() -- control flow (loops,
+// cursors, exception handling) can't be abstracted portably across
+// engines, so Body always supplies the full raw SQL body; Param builds
+// the portable signature dbobjects renders per engine.
+//
+//	proc := procedure.New("recalc_balances").
+//		Param("user_id", procedure.Int).
+//		Body("UPDATE accounts SET balance = balance + 1 WHERE id = user_id;")
+//
+// A built Definition is dialect-agnostic; github.com/bg12345/gorm-dbobjects's
+// Client resolves it to the connected engine's actual DDL. Not
+// supported on SQLite, which has no stored procedure concept at all.
 package procedure
 
 import (
