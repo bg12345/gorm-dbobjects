@@ -6,6 +6,8 @@ are release-tag dates.
 
 ## [Unreleased]
 
+## [v0.7.0] - 2026-09-09
+
 ### Added
 - Package-level doc comments for `dbobjects`, `trigger`, `view`, and
   `procedure` — previously blank on pkg.go.dev's package pages.
