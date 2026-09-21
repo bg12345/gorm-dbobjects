@@ -6,6 +6,30 @@ are release-tag dates.
 
 ## [Unreleased]
 
+## [v0.8.0] - 2026-09-21
+
+### Added
+- README "Known limitations" section — the real, user-facing gaps in
+  what's shipped (composite/missing-PK restrictions on `Set()`, no
+  column-scoped/conditional trigger API, unvalidated `Body()`/`Raw()`
+  content, no materialized views, no introspection API, and more) —
+  previously only tracked in this project's own local design notes,
+  not visible to anyone actually using the library.
+- A note in "Migration-tool interop" that Atlas gates the object kinds
+  this library generates (views, triggers, procedures/functions) behind
+  its paid Pro plan, and that its `composite_schema` data source needed
+  to combine `dbobjects`'s schema with gorm's own is separately
+  Pro-gated too — worth knowing before wiring up that integration, not
+  discovered after.
+- A release-tag badge in the README.
+
+### Fixed
+- "How it's built" no longer calls `procedure` an "eventually" kind —
+  stale since v0.6.0 shipped it.
+
+Second step of the pre-`v1.0.0` stability pass (README as the final
+pitch) — no functional/API changes.
+
 ## [v0.7.0] - 2026-09-09
 
 ### Added
