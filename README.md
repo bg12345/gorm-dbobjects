@@ -2,6 +2,7 @@
 
 [![Tests](https://github.com/bg12345/gorm-dbobjects/actions/workflows/tests.yml/badge.svg)](https://github.com/bg12345/gorm-dbobjects/actions/workflows/tests.yml)
 [![Go Reference](https://pkg.go.dev/badge/github.com/bg12345/gorm-dbobjects.svg)](https://pkg.go.dev/github.com/bg12345/gorm-dbobjects)
+[![Release](https://img.shields.io/github/v/tag/bg12345/gorm-dbobjects?label=release)](https://github.com/bg12345/gorm-dbobjects/tags)
 [![License: MIT](https://img.shields.io/badge/License-MIT-yellow.svg)](LICENSE)
 
 **Manage database-side objects — triggers, views, stored procedures —
@@ -198,7 +199,7 @@ proc := procedure.New("sp_set_user_name").
 
 ## How it's built
 
-Each object kind (`trigger`, `view`, and eventually `procedure`) is its
+Each object kind (`trigger`, `view`, `procedure`) is its
 own small package with a fluent builder and zero knowledge of SQL
 dialects — `trigger.BeforeUpdate(&User{}).Set(...)` only knows about
 gorm schemas. A separate dialect layer, resolved from the connected
@@ -246,6 +247,60 @@ just gets in its way:
 ```go
 stmts, _ := client.Render(dbobjects.Declarative, tr)
 ```
+
+Worth knowing before wiring this up: Atlas gates the object kinds this
+library generates — views, triggers, and stored procedures/functions —
+behind its paid Pro plan, across every database engine Atlas supports,
+not a free-tier feature. Combining `dbobjects`'s schema with gorm's own
+table schema also needs Atlas's `composite_schema` data source, which
+is separately Pro-gated regardless of what it's combining. `Render`
+itself has no Atlas dependency and works with any consumer of plain
+SQL strings — Atlas is one option for using that output, not the only
+one, and not a free one for what this library actually produces.
+
+## Known limitations
+
+Real gaps in what's shipped today, not just missing engines — worth
+knowing before you hit them rather than after.
+
+**Triggers**
+- `Set()` on `AfterInsert`/`AfterUpdate` needs a table with exactly one
+  primary key column (it renders as a follow-up `UPDATE` keyed by PK) —
+  composite or missing-PK tables can't use it; `Body()` is the escape
+  hatch. On SQL Server this restriction applies to *every* `Set()`
+  call, not just `AFTER`, since SQL Server has no `BEFORE` DML trigger
+  at all and `Set()` always renders `AFTER` there.
+- No column-scoped triggers (`UPDATE OF col1, col2`) and no portable
+  conditional-trigger (`WHEN (...)`) API — every trigger fires on any
+  write to the table; scope it yourself inside `Body()` if you need to.
+- `Body()`/`Raw()` content is unvalidated SQL — a typo surfaces as a
+  live database error at `Register()` time, not a build-time check.
+- On SQL Server, `Body()` on a `BEFORE`-declared trigger is a hard
+  render-time error — SQL Server has no `BEFORE` DML trigger to keep,
+  and there's no library-supported workaround (a raw `INSTEAD OF`
+  trigger issued outside this library is the only path).
+
+**Views**
+- `Query(fn)` accepts an arbitrary gorm callback, so there's no
+  single-table column list to validate a typo'd name against, the way
+  `Set()` does for triggers.
+- No materialized view support on Postgres — `view.New(...)` only ever
+  renders a plain `CREATE VIEW`.
+
+**Procedures**
+- A `Uint`-typed Go field has no portable `ParamType` via `TypeOf` —
+  Postgres and SQL Server have no native unsigned integer type at all.
+  Use `Raw()` explicitly for it.
+- Not supported on SQLite, which has no stored procedure concept at
+  all.
+
+**Cross-cutting**
+- No introspection API — `Client` only has `Register`/`Drop`/`Render`;
+  there's no way to ask "what does this library currently think it
+  owns" short of querying each engine's own system catalog directly.
+- `Render(Declarative)` output is handed back as plain strings with no
+  syntax validation — a typo inside `Body()`/`Raw()` flows straight
+  through to whatever consumes it.
 
 ## Testing
 
