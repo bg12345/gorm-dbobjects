@@ -6,6 +6,23 @@ are release-tag dates.
 
 ## [Unreleased]
 
+## [v1.0.0] - 2026-10-01
+
+The public API is now stable. Triggers, views, and stored procedures
+are implemented and verified end-to-end (real databases, not just unit
+tests) on Postgres, MySQL, SQLite, and SQL Server (procedures on
+Postgres/MySQL/SQL Server — SQLite has no stored procedure concept at
+all). No functional changes from v0.9.0 — this release is the freeze
+declared there becoming official. See the README's "Known limitations"
+section for the real, documented gaps in what's shipped, and
+`CHANGELOG.md`'s own history above for everything that landed on the
+way here.
+
+A note on what comes next: any future breaking change now means a
+`/v2` import path (`github.com/bg12345/gorm-dbobjects/v2`), per Go's
+own module versioning rules — not a routine minor bump the way the
+pre-1.0 breaks (the `Client` refactor, `Render`'s signature) were.
+
 ## [v0.9.0] - 2026-10-01
 
 Final step of the pre-`v1.0.0` stability pass: a deliberate review of
