@@ -6,6 +6,33 @@ are release-tag dates.
 
 ## [Unreleased]
 
+## [v0.9.0] - 2026-10-01
+
+Final step of the pre-`v1.0.0` stability pass: a deliberate review of
+every exported symbol across `dbobjects`/`trigger`/`view`/`procedure`
+(the full surface, pulled via `go doc -all`, not just recalled), asking
+"is this staying exactly like this after 1.0?" — since a break after
+1.0 means a `/v2` import-path change, not just another minor bump. The
+surface itself needed no changes; review did catch two stale doc
+comments and one worth stating explicitly:
+
+### Fixed
+- `Client.Drop`'s doc comment still said "and later view/procedure" —
+  both shipped in v0.1.0 and v0.6.0 respectively.
+- `renderViewCreateOrReplace`'s doc comment still said SQL Server's and
+  SQLite's own view rendering "will need their own implementations
+  later" — both have existed since v0.4.0/v0.5.0.
+
+### Added
+- `Client`'s doc comment now states explicitly that it's safe for
+  concurrent use from multiple goroutines (true since `NewClient` —
+  immutable after construction, same as the `*gorm.DB` it wraps — just
+  previously unstated).
+
+Also confirmed CI is actually green on a real run (GitHub Actions'
+run history for `main`, not assumed from local testing) before calling
+the API frozen.
+
 ## [v0.8.0] - 2026-09-21
 
 ### Added

@@ -633,8 +633,9 @@ func resolveViewBody(db *gorm.DB, def *view.Definition) string {
 // renderViewCreateOrReplace renders def as a CREATE OR REPLACE VIEW
 // statement -- shared by postgresDialect and mysqlDialect since both
 // support identical syntax here, unlike triggers where the two engines
-// diverge structurally (SQL Server's CREATE OR ALTER and SQLite's lack
-// of CREATE OR REPLACE will need their own implementations later).
+// diverge structurally (SQL Server has its own renderViewCreateOrAlter,
+// and SQLite composes renderView from the shared drop/create helpers
+// instead, since it has no CREATE OR REPLACE VIEW at all).
 func renderViewCreateOrReplace(db *gorm.DB, def *view.Definition) ([]string, error) {
 	return []string{fmt.Sprintf(`CREATE OR REPLACE VIEW %s AS %s`, def.Name, resolveViewBody(db, def))}, nil
 }
