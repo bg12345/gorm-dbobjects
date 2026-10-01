@@ -44,6 +44,9 @@ type DBObject interface {
 	Kind() string
 }
 
+// Client wraps a *gorm.DB connection and resolves the dialect that
+// matches it. Immutable after NewClient -- safe for concurrent use
+// from multiple goroutines, since gorm's own *gorm.DB already is.
 type Client struct {
 	db *gorm.DB
 }
@@ -243,7 +246,7 @@ func (c *Client) Register(ctx context.Context, objects ...DBObject) error {
 
 
 // Drop removes each object's corresponding DB-side definition (trigger,
-// and later view/procedure) from the Client's DB. Safe to
+// view, or procedure) from the Client's DB. Safe to
 // call for objects that were never registered -- dialect DropTrigger
 // implementations use DROP ... IF EXISTS.
 func (c *Client) Drop(ctx context.Context, objects ...DBObject) error {
