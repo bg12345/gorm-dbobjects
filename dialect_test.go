@@ -1413,3 +1413,94 @@ func slicesEqual(a, b []string) bool {
 	}
 	return true
 }
+
+// Materialized-view rendering. Like the plain-view tests above, these use
+// RawSQL so a nil *gorm.DB is safe -- the Query() path is covered by the
+// Postgres integration test in tests/view_test.go.
+
+func TestPostgresDialect_RenderMaterializedView_Raw(t *testing.T) {
+	def := &view.Definition{
+		Name:         "daily_totals",
+		RawSQL:       "SELECT count(*) FROM user_master",
+		Materialized: true,
+	}
+
+	stmts, err := postgresDialect{}.renderMaterializedView(nil, def)
+	if err != nil {
+		t.Fatalf("renderMaterializedView() error = %v", err)
+	}
+	// Postgres has no CREATE OR REPLACE MATERIALIZED VIEW, so this must
+	// be a DROP followed by a CREATE, as two separate statements.
+	want := []string{
+		`DROP MATERIALIZED VIEW IF EXISTS daily_totals;`,
+		`CREATE MATERIALIZED VIEW daily_totals AS SELECT count(*) FROM user_master`,
+	}
+	if len(stmts) != len(want) {
+		t.Fatalf("renderMaterializedView() returned %d statement(s), want %d:\n%s", len(stmts), len(want), strings.Join(stmts, "\n---\n"))
+	}
+	for i := range want {
+		if stmts[i] != want[i] {
+			t.Errorf("renderMaterializedView()[%d] = %q, want %q", i, stmts[i], want[i])
+		}
+	}
+}
+
+func TestPostgresDialect_RenderMaterializedViewDeclarative_Raw(t *testing.T) {
+	def := &view.Definition{
+		Name:         "daily_totals",
+		RawSQL:       "SELECT count(*) FROM user_master",
+		Materialized: true,
+	}
+
+	stmts, err := postgresDialect{}.renderMaterializedViewDeclarative(nil, def)
+	if err != nil {
+		t.Fatalf("renderMaterializedViewDeclarative() error = %v", err)
+	}
+	if len(stmts) != 1 {
+		t.Fatalf("renderMaterializedViewDeclarative() returned %d statement(s), want 1:\n%s", len(stmts), strings.Join(stmts, "\n---\n"))
+	}
+	want := `CREATE MATERIALIZED VIEW daily_totals AS SELECT count(*) FROM user_master`
+	if stmts[0] != want {
+		t.Errorf("renderMaterializedViewDeclarative()[0] = %q, want %q", stmts[0], want)
+	}
+}
+
+// A plain DROP VIEW errors on a materialized view in Postgres, so the
+// drop path has to use its own spelling.
+func TestPostgresDialect_DropMaterializedView(t *testing.T) {
+	def := &view.Definition{Name: "daily_totals", Materialized: true}
+
+	stmts, err := postgresDialect{}.dropMaterializedView(def)
+	if err != nil {
+		t.Fatalf("dropMaterializedView() error = %v", err)
+	}
+	if len(stmts) != 1 {
+		t.Fatalf("dropMaterializedView() returned %d statement(s), want 1:\n%s", len(stmts), strings.Join(stmts, "\n---\n"))
+	}
+	want := `DROP MATERIALIZED VIEW IF EXISTS daily_totals;`
+	if stmts[0] != want {
+		t.Errorf("dropMaterializedView()[0] = %q, want %q", stmts[0], want)
+	}
+}
+
+// Capability is checked by type assertion, so only Postgres may satisfy
+// materializedViewDialect -- MySQL/SQLite/SQL Server rejecting
+// materialized views needs no code of its own, same as SQLite and
+// procedures.
+func TestMaterializedViewDialect_OnlyPostgres(t *testing.T) {
+	tests := []struct {
+		name string
+		d    dialect
+		want bool
+	}{
+		{"postgres", postgresDialect{}, true},
+		{"mysql", mysqlDialect{}, false},
+		{"sqlite", sqliteDialect{}, false},
+		{"sqlserver", sqlServerDialect{}, false},
+	}
+	for _, tt := range tests {
+		if _, got := tt.d.(materializedViewDialect); got != tt.want {
+			t.Errorf("%s implements materializedViewDialect = %v, want %v", tt.name, got, tt.want)
+		}
+	}
+}

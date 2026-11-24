@@ -24,6 +24,15 @@ type viewDialect interface {
 	dropView(def *view.Definition) ([]string, error)
 }
 
+// materializedViewDialect is implemented only by engines with a real
+// materialized view concept -- currently Postgres. Checked by type
+// assertion in resolveDDL, same idiom as the other per-kind interfaces.
+type materializedViewDialect interface {
+	renderMaterializedView(db *gorm.DB, def *view.Definition) ([]string, error)
+	renderMaterializedViewDeclarative(db *gorm.DB, def *view.Definition) ([]string, error)
+	dropMaterializedView(def *view.Definition) ([]string, error)
+}
+
 // procedureDialect is implemented only by engines with a real stored
 // procedure concept -- Postgres, MySQL, SQL Server. Not sqliteDialect
 // (SQLite has none at all): resolveDDL's existing d.(procedureDialect)
@@ -640,12 +649,23 @@ func renderViewCreateOrReplace(db *gorm.DB, def *view.Definition) ([]string, err
 	return []string{fmt.Sprintf(`CREATE OR REPLACE VIEW %s AS %s`, def.Name, resolveViewBody(db, def))}, nil
 }
 
+func renderMaterializedViewDropCreate(db *gorm.DB, def *view.Definition) ([]string, error) {
+	return []string{
+		fmt.Sprintf(`DROP MATERIALIZED VIEW IF EXISTS %s;`, def.Name),
+		fmt.Sprintf(`CREATE MATERIALIZED VIEW %s AS %s`, def.Name, resolveViewBody(db, def)),
+	}, nil
+}
+
 // renderViewCreate renders def as a bare CREATE VIEW statement -- no OR
 // REPLACE -- for structural DDL consumers (e.g. an Atlas external
 // schema source). Shared by both dialects for the same reason
 // renderViewCreateOrReplace is.
 func renderViewCreate(db *gorm.DB, def *view.Definition) ([]string, error) {
 	return []string{fmt.Sprintf(`CREATE VIEW %s AS %s`, def.Name, resolveViewBody(db, def))}, nil
+}
+
+func renderMaterializedViewCreate(db *gorm.DB, def *view.Definition) ([]string, error) {
+	return []string{fmt.Sprintf(`CREATE MATERIALIZED VIEW %s AS %s`, def.Name, resolveViewBody(db, def))}, nil
 }
 
 // renderViewCreateOrAlter renders def as a CREATE OR ALTER VIEW
@@ -661,6 +681,10 @@ func dropViewIfExists(def *view.Definition) ([]string, error) {
 	return []string{fmt.Sprintf(`DROP VIEW IF EXISTS %s;`, def.Name)}, nil
 }
 
+func dropMaterializedViewIfExists(def *view.Definition) ([]string, error) {
+	return []string{fmt.Sprintf(`DROP MATERIALIZED VIEW IF EXISTS %s;`, def.Name)}, nil
+}
+
 func (postgresDialect) renderView(db *gorm.DB, def *view.Definition) ([]string, error) {
 	return renderViewCreateOrReplace(db, def)
 }
@@ -671,6 +695,18 @@ func (postgresDialect) renderViewDeclarative(db *gorm.DB, def *view.Definition) 
 
 func (postgresDialect) dropView(def *view.Definition) ([]string, error) {
 	return dropViewIfExists(def)
+}
+
+func (postgresDialect) renderMaterializedView(db *gorm.DB, def *view.Definition) ([]string, error) {
+	return renderMaterializedViewDropCreate(db, def)
+}
+
+func (postgresDialect) renderMaterializedViewDeclarative(db *gorm.DB, def *view.Definition) ([]string, error) {
+	return renderMaterializedViewCreate(db, def)
+}
+
+func (postgresDialect) dropMaterializedView(def *view.Definition) ([]string, error) {
+	return dropMaterializedViewIfExists(def)
 }
 
 func (mysqlDialect) renderView(db *gorm.DB, def *view.Definition) ([]string, error) {
@@ -969,3 +1005,4 @@ var _ viewDialect = postgresDialect{}
 var _ viewDialect = mysqlDialect{}
 var _ viewDialect = sqliteDialect{}
 var _ viewDialect = sqlServerDialect{}
+var _ materializedViewDialect = postgresDialect{}

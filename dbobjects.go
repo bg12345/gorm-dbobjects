@@ -113,6 +113,22 @@ func (c *Client) resolveDDL(d dialect, obj DBObject, op ddlOp) (stmts []string, 
 		if err != nil {
 			return nil, "", "", err
 		}
+		if def.Materialized {
+			vd, ok := d.(materializedViewDialect)
+			if !ok {
+				return nil, "", "", fmt.Errorf("dbobjects: dialect %q does not support materialized views", d.Name())
+			}
+			desc = fmt.Sprintf("materialized view %q", def.Name)
+			switch op {
+			case opDrop:
+				stmts, err = vd.dropMaterializedView(def)
+			case opRenderDeclarative:
+				stmts, err = vd.renderMaterializedViewDeclarative(c.db, def)
+			default:
+				stmts, err = vd.renderMaterializedView(c.db, def)
+			}
+			return stmts, desc, def.Name, err
+		}
 		vd, ok := d.(viewDialect)
 		if !ok {
 			return nil, "", "", fmt.Errorf("dbobjects: dialect %q does not support views", d.Name())

@@ -158,6 +158,16 @@ v := view.New("recent_signups").
     Raw("SELECT * FROM (SELECT * FROM users ORDER BY created_at DESC) WHERE ROWNUM <= 100")
 ```
 
+On Postgres, `Materialized()` turns a view into a materialized one — its result is stored and only changes when you `REFRESH MATERIALIZED VIEW` it yourself, which `dbobjects` doesn't do for you. Because Postgres has no `CREATE OR REPLACE MATERIALIZED VIEW`, `Register` drops and recreates it. Every other engine returns an error from `Register`, `Drop`, and `Render` rather than silently creating a plain view:
+
+```go
+v := view.New("daily_totals").
+    Query(func(tx *gorm.DB) *gorm.DB {
+        return tx.Model(&Order{}).Select("date(created_at) AS day, count(*) AS n").Group("day")
+    }).
+    Materialized()
+```
+
 Stored procedures generate the signature/wrapper ceremony the same way
 — `CREATE OR REPLACE PROCEDURE`, `DROP IF EXISTS` + `CREATE`, `CREATE OR
 ALTER PROCEDURE` — around a raw SQL body, since control flow (loops,
@@ -284,8 +294,12 @@ knowing before you hit them rather than after.
 - `Query(fn)` accepts an arbitrary gorm callback, so there's no
   single-table column list to validate a typo'd name against, the way
   `Set()` does for triggers.
-- No materialized view support on Postgres — `view.New(...)` only ever
-  renders a plain `CREATE VIEW`.
+- Materialized views are Postgres-only (`Materialized()`); MySQL, SQLite,
+  and SQL Server return an error. There's no `REFRESH MATERIALIZED VIEW`
+  support, so refreshing is up to the caller, and `Register` drops and
+  recreates the view each time since Postgres has no `CREATE OR REPLACE`
+  for them. Switching an existing view between plain and materialized
+  under the same name isn't handled — drop it first.
 
 **Procedures**
 - A `Uint`-typed Go field has no portable `ParamType` via `TypeOf` —

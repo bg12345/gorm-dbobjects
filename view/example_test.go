@@ -19,3 +19,17 @@ func Example() {
 	// Output:
 	// active_users
 }
+
+func ExampleView_Materialized() {
+	def, err := view.New("daily_totals").
+		Raw("SELECT count(*) FROM users").
+		Materialized().
+		Build()
+	if err != nil {
+		fmt.Println(err)
+		return
+	}
+	fmt.Println(def.Name, def.Materialized)
+	// Output:
+	// daily_totals true
+}

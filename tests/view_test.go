@@ -222,3 +222,97 @@ func TestRegister_SQLServer_AppliesView(t *testing.T) {
 		t.Errorf("view returned row with Name = %q, want %q", rows[0].Name, "ViewTestMatchSQLServer")
 	}
 }
+
+// TestRegister_AppliesMaterializedView is an integration test: it
+// registers a materialized view on a real Postgres via the Query(fn)
+// path, checks it's registered in pg_matviews (not pg_views), and proves
+// the view really is materialized -- a row inserted after Register is
+// invisible until the view is refreshed. Registering twice also proves
+// the drop-then-create rendering is idempotent. Skips itself if no
+// Postgres is reachable.
+func TestRegister_AppliesMaterializedView(t *testing.T) {
+	db, err := testutil.NewPostgres()
+	if err != nil {
+		t.Skipf("skipping integration test, no Postgres reachable: %v", err)
+	}
+
+	if err := db.AutoMigrate(&testutil.UserMaster{}); err != nil {
+		t.Fatalf("AutoMigrate: %v", err)
+	}
+
+	client := dbobjects.NewClient(db)
+	ctx := context.Background()
+
+	v := view.New("mv_test_active_users").
+		Query(func(tx *gorm.DB) *gorm.DB {
+			return tx.Model(&testutil.UserMaster{}).Where("name = ?", "MatViewTestMatch")
+		}).
+		Materialized()
+
+	if err := client.Register(ctx, v); err != nil {
+		t.Fatalf("Register: %v", err)
+	}
+	t.Cleanup(func() {
+		_ = client.Drop(ctx, v)
+	})
+	if err := client.Register(ctx, v); err != nil {
+		t.Fatalf("second Register (idempotency): %v", err)
+	}
+
+	var n int64
+	if err := db.Raw("SELECT count(*) FROM pg_matviews WHERE matviewname = ?", "mv_test_active_users").Scan(&n).Error; err != nil {
+		t.Fatalf("querying pg_matviews: %v", err)
+	}
+	if n != 1 {
+		t.Fatalf("pg_matviews has %d row(s) for the view, want 1", n)
+	}
+
+	match := testutil.UserMaster{Name: "MatViewTestMatch", Email: fmt.Sprintf("matview-%d@example.com", time.Now().UnixNano())}
+	if err := db.Create(&match).Error; err != nil {
+		t.Fatalf("Create: %v", err)
+	}
+	t.Cleanup(func() {
+		db.Unscoped().Delete(&match)
+	})
+
+	var rows []testutil.UserMaster
+	if err := db.Table("mv_test_active_users").Find(&rows).Error; err != nil {
+		t.Fatalf("querying view: %v", err)
+	}
+	if len(rows) != 0 {
+		t.Fatalf("materialized view returned %d row(s) before refresh, want 0 (it's a snapshot)", len(rows))
+	}
+
+	if err := db.Exec("REFRESH MATERIALIZED VIEW mv_test_active_users").Error; err != nil {
+		t.Fatalf("refresh: %v", err)
+	}
+	if err := db.Table("mv_test_active_users").Find(&rows).Error; err != nil {
+		t.Fatalf("querying view after refresh: %v", err)
+	}
+	if len(rows) != 1 || rows[0].Name != "MatViewTestMatch" {
+		t.Fatalf("after refresh got %+v, want exactly the one matching row", rows)
+	}
+}
+
+// TestRegister_SQLite_RejectsMaterializedView proves an engine without
+// materialized views errors clearly from Register/Render, before any DDL
+// runs. SQLite needs no external service, so this never self-skips.
+func TestRegister_SQLite_RejectsMaterializedView(t *testing.T) {
+	db, err := testutil.NewSQLite(newSQLiteDSN(t))
+	if err != nil {
+		t.Skipf("skipping integration test, no SQLite available: %v", err)
+	}
+
+	client := dbobjects.NewClient(db)
+	v := view.New("mv_sqlite").Raw("SELECT 1").Materialized()
+
+	if err := client.Register(context.Background(), v); err == nil {
+		t.Error("Register() error = nil, want error: SQLite has no materialized views")
+	}
+	if _, err := client.Render(dbobjects.Declarative, v); err == nil {
+		t.Error("Render() error = nil, want error: SQLite has no materialized views")
+	}
+	if err := client.Drop(context.Background(), v); err == nil {
+		t.Error("Drop() error = nil, want error: SQLite has no materialized views")
+	}
+}

@@ -19,22 +19,25 @@ import (
 )
 
 type Definition struct {
-	Name    string
-	QueryFn func(*gorm.DB) *gorm.DB
-	RawSQL  string
+	Name         string
+	QueryFn      func(*gorm.DB) *gorm.DB
+	RawSQL       string
+	Materialized bool
 }
 
 type View interface {
 	Kind() string
 	Query(fn func(*gorm.DB) *gorm.DB) View
 	Raw(sql string) View
+	Materialized() View
 	Build() (*Definition, error)
 }
 
 type viewBuilder struct {
-	name    string
-	queryFn func(*gorm.DB) *gorm.DB
-	rawSQL  string
+	name         string
+	queryFn      func(*gorm.DB) *gorm.DB
+	rawSQL       string
+	materialized bool
 }
 
 // New starts building a view named name. Unlike trigger.BeforeUpdate,
@@ -47,6 +50,16 @@ func New(name string) View {
 
 func (v *viewBuilder) Query(fn func(*gorm.DB) *gorm.DB) View {
 	v.queryFn = fn
+	return v
+}
+
+// Materialized marks the view as materialized: its query result is
+// stored and has to be refreshed explicitly (dbobjects doesn't issue
+// REFRESH). Only Postgres supports this; Register/Drop/Render error on
+// every other engine. A materialized view can't be created with
+// CREATE OR REPLACE, so Register drops and recreates it.
+func (v *viewBuilder) Materialized() View {
+	v.materialized = true
 	return v
 }
 
@@ -70,13 +83,13 @@ func (v *viewBuilder) Build() (*Definition, error) {
 		return nil, fmt.Errorf("view: %q has no Query or Raw set", v.name)
 	}
 	return &Definition{
-		Name:    v.name,
-		QueryFn: v.queryFn,
-		RawSQL:  v.rawSQL,
+		Name:         v.name,
+		QueryFn:      v.queryFn,
+		RawSQL:       v.rawSQL,
+		Materialized: v.materialized,
 	}, nil
 }
 
 func (v *viewBuilder) Kind() string {
 	return "view"
 }
-
