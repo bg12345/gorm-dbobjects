@@ -166,6 +166,103 @@ func sortedSetColumns(sets map[string]trigger.Expr) []string {
 	return columns
 }
 
+// rowRefs renders values in sorted column order, resolving Column and
+// Previous against row and prev, the names this engine uses for the
+// firing row and for its values before an UPDATE.
+func rowRefs(values map[string]trigger.Expr, row, prev string, renderExpr func(trigger.Expr) string) (cols, vals []string) {
+	cols = sortedSetColumns(values)
+	vals = make([]string, len(cols))
+	for i, name := range cols {
+		switch e := values[name]; e.Kind {
+		case trigger.ExprColumn:
+			vals[i] = row + "." + e.Raw
+		case trigger.ExprPrevious:
+			vals[i] = prev + "." + e.Raw
+		default:
+			vals[i] = renderExpr(e)
+		}
+	}
+	return cols, vals
+}
+
+// equalities renders "<prefix>col = value" for each pair.
+func equalities(prefix string, cols, vals []string) []string {
+	out := make([]string, len(cols))
+	for i := range cols {
+		out[i] = fmt.Sprintf("%s%s = %s", prefix, cols[i], vals[i])
+	}
+	return out
+}
+
+// rowActionStmt renders def.Action for the engines with row-level
+// triggers (Postgres, MySQL, SQLite), which expose the firing row as
+// NEW/OLD.
+func rowActionStmt(def *trigger.Definition, renderExpr func(trigger.Expr) string) string {
+	a := def.Action
+	row := "NEW"
+	if def.Event == "DELETE" {
+		row = "OLD"
+	}
+	cols, vals := rowRefs(a.Values, row, "OLD", renderExpr)
+	matchCols, matchVals := rowRefs(a.Match, row, "OLD", renderExpr)
+	where := strings.Join(equalities("", matchCols, matchVals), " AND ")
+
+	switch a.Op {
+	case trigger.OpUpdate:
+		return fmt.Sprintf("UPDATE %s SET %s WHERE %s;", a.Table, strings.Join(equalities("", cols, vals), ", "), where)
+	case trigger.OpDelete:
+		return fmt.Sprintf("DELETE FROM %s WHERE %s;", a.Table, where)
+	default:
+		return fmt.Sprintf("INSERT INTO %s (%s) VALUES (%s);", a.Table, strings.Join(cols, ", "), strings.Join(vals, ", "))
+	}
+}
+
+// actionStmt renders def.Action for SQL Server, whose triggers fire once
+// per statement: the firing rows come from the inserted/deleted
+// pseudo-tables, selected from for an insert and joined to the target for
+// an update or delete. Only an UPDATE that reads both old and new values
+// needs those two joined to each other, which takes a primary key.
+func (d sqlServerDialect) actionStmt(def *trigger.Definition) (string, error) {
+	a := def.Action
+	var current, previous bool
+	for _, m := range []map[string]trigger.Expr{a.Values, a.Match} {
+		for _, e := range m {
+			current = current || e.Kind == trigger.ExprColumn
+			previous = previous || e.Kind == trigger.ExprPrevious
+		}
+	}
+
+	from := "inserted AS src"
+	switch {
+	case def.Event == "DELETE":
+		from = "deleted AS src"
+	case previous && !current:
+		from = "deleted AS prev"
+	case previous:
+		if def.PrimaryKey == "" {
+			return "", fmt.Errorf("dbobjects: sqlserver using both Column and Previous requires table %q to have exactly one primary key column",
+				def.Table)
+		}
+		from = fmt.Sprintf("inserted AS src INNER JOIN deleted AS prev ON src.%[1]s = prev.%[1]s", def.PrimaryKey)
+	}
+
+	cols, vals := rowRefs(a.Values, "src", "prev", d.renderExpr)
+	if a.Op == trigger.OpInsert {
+		return fmt.Sprintf("INSERT INTO %s (%s) SELECT %s FROM %s;",
+			a.Table, strings.Join(cols, ", "), strings.Join(vals, ", "), from), nil
+	}
+
+	// CROSS JOIN ... WHERE rather than JOIN ... ON: from may already be a
+	// join, and the conditions apply to the target either way.
+	matchCols, matchVals := rowRefs(a.Match, "src", "prev", d.renderExpr)
+	tail := fmt.Sprintf("FROM %s AS t CROSS JOIN %s WHERE %s",
+		a.Table, from, strings.Join(equalities("t.", matchCols, matchVals), " AND "))
+	if a.Op == trigger.OpDelete {
+		return fmt.Sprintf("DELETE t %s;", tail), nil
+	}
+	return fmt.Sprintf("UPDATE t SET %s %s;", strings.Join(equalities("", cols, vals), ", "), tail), nil
+}
+
 // triggerBody renders the BEGIN...END body for def's trigger function and
 // the RETURN variable (NEW/OLD) it should use. Shared by renderTrigger
 // and renderTriggerDeclarative so the two variants can never diverge on
@@ -178,6 +275,8 @@ func (d postgresDialect) triggerBody(def *trigger.Definition) (body, retVar stri
 	switch {
 	case def.Body != "":
 		fmt.Fprintf(&b, "  %s\n", def.Body)
+	case def.Action != nil:
+		fmt.Fprintf(&b, "  %s\n", rowActionStmt(def, d.renderExpr))
 	case def.Timing == "AFTER":
 		// NEW isn't assignable once an AFTER trigger fires -- the row's
 		// already written -- so Set() renders as an explicit follow-up
@@ -275,6 +374,8 @@ func (d mysqlDialect) triggerBody(def *trigger.Definition, trgName string) strin
 	switch {
 	case def.Body != "":
 		fmt.Fprintf(&body, "  %s\n", def.Body)
+	case def.Action != nil:
+		fmt.Fprintf(&body, "  %s\n", rowActionStmt(def, d.renderExpr))
 	case def.Timing == "AFTER":
 		// NEW isn't assignable in a MySQL AFTER trigger at all ("Updating
 		// of NEW row is not allowed in after trigger"), so Set() renders
@@ -378,6 +479,9 @@ func (d sqliteDialect) triggerBody(def *trigger.Definition, trgName string) (bod
 	if def.Body != "" {
 		return fmt.Sprintf("  %s\n", def.Body), ""
 	}
+	if def.Action != nil {
+		return fmt.Sprintf("  %s\n", rowActionStmt(def, d.renderExpr)), ""
+	}
 
 	columns := sortedSetColumns(def.Sets)
 	assigns := make([]string, len(columns))
@@ -425,8 +529,8 @@ BEGIN
 
 // effectiveTriggerTiming returns the timing SQLite DDL should actually
 // use for def. Set()-based triggers always render as AFTER (see
-// triggerBody's doc comment); Body()-based triggers keep def.Timing
-// verbatim, since a literal BEFORE UPDATE ... WHEN ... BEGIN
+// triggerBody's doc comment); Body()- and Action-based triggers keep
+// def.Timing verbatim, since a literal BEFORE UPDATE ... WHEN ... BEGIN
 // SELECT RAISE(...) END read-only-validation pattern has nothing to do
 // with the NEW-assignment problem Set() has to work around.
 //
@@ -440,7 +544,7 @@ BEGIN
 // targets the right trigger. Not fixed here since it'd mean special-
 // casing the shared triggerNames helper for one dialect's benefit.
 func effectiveTriggerTiming(def *trigger.Definition) string {
-	if def.Body == "" {
+	if def.Body == "" && def.Action == nil {
 		return "AFTER"
 	}
 	return def.Timing
@@ -524,6 +628,16 @@ func (d sqlServerDialect) triggerBody(def *trigger.Definition) (string, error) {
 				sqlServerAfterConstructorHint(def.Event))
 		}
 		return fmt.Sprintf("  %s\n", def.Body), nil
+	}
+
+	// A BEFORE-declared action renders AFTER, like Set(), within the same
+	// transaction.
+	if def.Action != nil {
+		stmt, err := d.actionStmt(def)
+		if err != nil {
+			return "", err
+		}
+		return fmt.Sprintf("  %s\n", stmt), nil
 	}
 
 	if def.PrimaryKey == "" {

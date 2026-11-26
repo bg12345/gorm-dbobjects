@@ -12,6 +12,7 @@ import (
 	dbobjects "github.com/bg12345/gorm-dbobjects"
 	"github.com/bg12345/gorm-dbobjects/internal/testutil"
 	"github.com/bg12345/gorm-dbobjects/trigger"
+	"gorm.io/gorm"
 )
 
 // --- trigger.Build() unit tests (no DB required) ---
@@ -231,6 +232,56 @@ func TestTrigger_AfterDelete_Body(t *testing.T) {
 	}
 	if def.Body == "" {
 		t.Error("Body is empty, want the raw SQL passed to Body()")
+	}
+}
+
+func TestInsertInto_BuildRejects(t *testing.T) {
+	ok := map[string]trigger.Expr{"user_master_id": trigger.Column("id")}
+	tests := map[string]trigger.Trigger{
+		"no columns":            trigger.AfterInsert(&testutil.UserMaster{}).InsertInto(&testutil.UserMasterLogs{}, nil),
+		"unknown target column": trigger.AfterInsert(&testutil.UserMaster{}).InsertInto(&testutil.UserMasterLogs{}, map[string]trigger.Expr{"nope": trigger.Now()}),
+		"unknown source column": trigger.AfterInsert(&testutil.UserMaster{}).InsertInto(&testutil.UserMasterLogs{}, map[string]trigger.Expr{"user_master_id": trigger.Column("nope")}),
+		"previous on insert":    trigger.AfterInsert(&testutil.UserMaster{}).InsertInto(&testutil.UserMasterLogs{}, map[string]trigger.Expr{"user_master_id": trigger.Previous("id")}),
+		"previous on delete":    trigger.AfterDelete(&testutil.UserMaster{}).InsertInto(&testutil.UserMasterLogs{}, map[string]trigger.Expr{"user_master_id": trigger.Previous("id")}),
+		"own table":             trigger.AfterInsert(&testutil.UserMaster{}).InsertInto(&testutil.UserMaster{}, map[string]trigger.Expr{"email": trigger.Column("email")}),
+		"called twice":          trigger.AfterInsert(&testutil.UserMaster{}).InsertInto(&testutil.UserMasterLogs{}, ok).InsertInto(&testutil.UserMasterLogs{}, ok),
+		"with Set":              trigger.BeforeInsert(&testutil.UserMaster{}).Set("email", trigger.Raw("'a'")).InsertInto(&testutil.UserMasterLogs{}, ok),
+		"with Body":             trigger.AfterInsert(&testutil.UserMaster{}).Body("SELECT 1;").InsertInto(&testutil.UserMasterLogs{}, ok),
+		"Column in Set":         trigger.BeforeInsert(&testutil.UserMaster{}).Set("email", trigger.Column("email")),
+		"Previous in Set":       trigger.BeforeUpdate(&testutil.UserMaster{}).SetColumns(map[string]trigger.Expr{"email": trigger.Previous("email")}),
+	}
+	for name, tr := range tests {
+		if _, err := tr.Build(); err == nil {
+			t.Errorf("%s: Build() error = nil, want error", name)
+		}
+	}
+}
+
+func TestUpdateIntoAndDeleteFrom_BuildRejects(t *testing.T) {
+	user := &testutil.UserMaster{}
+	logs := &testutil.UserMasterLogs{}
+	set := map[string]trigger.Expr{"new_name": trigger.Raw("'x'")}
+	match := map[string]trigger.Expr{"user_master_id": trigger.Column("id")}
+	literal := map[string]trigger.Expr{"log_message": trigger.Raw("'x'")}
+
+	tests := map[string]trigger.Trigger{
+		"no match":             trigger.AfterDelete(user).DeleteFrom(logs, nil),
+		"match without a row":  trigger.AfterDelete(user).DeleteFrom(logs, literal),
+		"update without a row": trigger.AfterUpdate(user).UpdateInto(logs, set, literal),
+		"nothing to set":       trigger.AfterUpdate(user).UpdateInto(logs, nil, match),
+		"unknown set column":   trigger.AfterUpdate(user).UpdateInto(logs, map[string]trigger.Expr{"nope": trigger.Now()}, match),
+		"unknown match column": trigger.AfterDelete(user).DeleteFrom(logs, map[string]trigger.Expr{"nope": trigger.Column("id")}),
+		"unknown source":       trigger.AfterDelete(user).DeleteFrom(logs, map[string]trigger.Expr{"user_master_id": trigger.Column("nope")}),
+		"previous on delete":   trigger.AfterDelete(user).DeleteFrom(logs, map[string]trigger.Expr{"user_master_id": trigger.Previous("id")}),
+		"own table":            trigger.AfterDelete(user).DeleteFrom(user, map[string]trigger.Expr{"id": trigger.Column("id")}),
+		"two actions":          trigger.AfterUpdate(user).UpdateInto(logs, set, match).DeleteFrom(logs, match),
+		"with Set":             trigger.BeforeUpdate(user).Set("name", trigger.Raw("'a'")).DeleteFrom(logs, match),
+		"with Body":            trigger.AfterDelete(user).Body("SELECT 1;").DeleteFrom(logs, match),
+	}
+	for name, tr := range tests {
+		if _, err := tr.Build(); err == nil {
+			t.Errorf("%s: Build() error = nil, want error", name)
+		}
 	}
 }
 
@@ -1289,4 +1340,251 @@ func TestRegister_SQLServer_RecursionGuardUnderExplicitRecursiveTriggersOn(t *te
 	if time.Since(reloaded.UpdatedAt) > 10*time.Second {
 		t.Errorf("UpdatedAt = %v, want a timestamp close to now (trigger should still have fired once)", reloaded.UpdatedAt)
 	}
+}
+
+// --- InsertInto ---
+
+// runInsertInto registers audit triggers for all three events and checks
+// the audit rows they write. The update touches two rows in one
+// statement, which is what exercises SQL Server's set-based form.
+// user_master is shared with other tests, so every statement and
+// assertion is limited to the two users created here.
+func runInsertInto(t *testing.T, db *gorm.DB) {
+	t.Helper()
+	_ = db.Migrator().DropTable(&testutil.UserMasterLogs{})
+	if err := db.AutoMigrate(&testutil.UserMaster{}, &testutil.UserMasterLogs{}); err != nil {
+		t.Fatalf("AutoMigrate: %v", err)
+	}
+	t.Cleanup(func() { _ = db.Migrator().DropTable(&testutil.UserMasterLogs{}) })
+
+	client := dbobjects.NewClient(db)
+	ctx := context.Background()
+	triggers := []dbobjects.DBObject{
+		trigger.AfterInsert(&testutil.UserMaster{}).InsertInto(&testutil.UserMasterLogs{}, map[string]trigger.Expr{
+			"user_master_id": trigger.Column("id"),
+			"log_message":    trigger.Raw("'insert'"),
+			"new_name":       trigger.Column("name"),
+		}),
+		trigger.AfterUpdate(&testutil.UserMaster{}).InsertInto(&testutil.UserMasterLogs{}, map[string]trigger.Expr{
+			"user_master_id": trigger.Column("id"),
+			"log_message":    trigger.Raw("'update'"),
+			"old_name":       trigger.Previous("name"),
+			"new_name":       trigger.Column("name"),
+		}),
+		trigger.AfterDelete(&testutil.UserMaster{}).InsertInto(&testutil.UserMasterLogs{}, map[string]trigger.Expr{
+			"user_master_id": trigger.Column("id"),
+			"log_message":    trigger.Raw("'delete'"),
+			"old_name":       trigger.Column("name"),
+		}),
+	}
+	if err := client.Register(ctx, triggers...); err != nil {
+		t.Fatalf("Register: %v", err)
+	}
+	t.Cleanup(func() { _ = client.Drop(ctx, triggers...) })
+
+	stamp := time.Now().UnixNano()
+	users := []testutil.UserMaster{
+		{Name: "Ann", Email: fmt.Sprintf("ann-insertinto-%d@example.com", stamp)},
+		{Name: "Bob", Email: fmt.Sprintf("bob-insertinto-%d@example.com", stamp)},
+	}
+	if err := db.Create(&users).Error; err != nil {
+		t.Fatalf("Create: %v", err)
+	}
+	a, b := users[0].ID, users[1].ID
+	t.Cleanup(func() { db.Unscoped().Delete(&users) })
+
+	if err := db.Exec("UPDATE user_master SET name = 'Same' WHERE id IN (?, ?)", a, b).Error; err != nil {
+		t.Fatalf("update: %v", err)
+	}
+	// Raw DELETE: gorm would soft-delete, which is an UPDATE.
+	if err := db.Exec("DELETE FROM user_master WHERE id = ?", a).Error; err != nil {
+		t.Fatalf("delete: %v", err)
+	}
+
+	var got []testutil.UserMasterLogs
+	if err := db.Where("user_master_id IN ?", []uint{a, b}).Find(&got).Error; err != nil {
+		t.Fatalf("Find: %v", err)
+	}
+	str := func(s *string) string {
+		if s == nil {
+			return "-"
+		}
+		return *s
+	}
+	type row struct {
+		user             uint
+		action, old, new string
+	}
+	have := map[row]int{}
+	for _, r := range got {
+		have[row{r.UserMasterID, r.LogMessage, str(r.OldName), str(r.NewName)}]++
+	}
+	want := []row{
+		{a, "insert", "-", "Ann"},
+		{b, "insert", "-", "Bob"},
+		{a, "update", "Ann", "Same"},
+		{b, "update", "Bob", "Same"},
+		{a, "delete", "Same", "-"},
+	}
+	if len(got) != len(want) {
+		t.Errorf("got %d audit rows, want %d: %+v", len(got), len(want), have)
+	}
+	for _, w := range want {
+		if have[w] != 1 {
+			t.Errorf("audit row %+v found %d time(s), want 1; have %+v", w, have[w], have)
+		}
+	}
+}
+
+func TestRegister_InsertInto_Postgres(t *testing.T) {
+	db, err := testutil.NewPostgres()
+	if err != nil {
+		t.Skipf("skipping integration test, no Postgres reachable: %v", err)
+	}
+	runInsertInto(t, db)
+}
+
+func TestRegister_InsertInto_MySQL(t *testing.T) {
+	db, err := testutil.NewMySQL()
+	if err != nil {
+		t.Skipf("skipping integration test, no MySQL reachable: %v", err)
+	}
+	runInsertInto(t, db)
+}
+
+func TestRegister_InsertInto_SQLite(t *testing.T) {
+	db, err := testutil.NewSQLite(newSQLiteDSN(t))
+	if err != nil {
+		t.Skipf("skipping integration test, no SQLite available: %v", err)
+	}
+	runInsertInto(t, db)
+}
+
+func TestRegister_InsertInto_SQLServer(t *testing.T) {
+	db, err := testutil.NewSQLServer()
+	if err != nil {
+		t.Skipf("skipping integration test, no SQL Server reachable: %v", err)
+	}
+	runInsertInto(t, db)
+}
+
+// --- UpdateInto / DeleteFrom ---
+
+// runUpdateIntoAndDeleteFrom keeps one log row per user in step with that
+// user: renaming rewrites it, deleting removes it. The update touches two
+// rows in one statement, and a third user proves unmatched rows are left
+// alone.
+func runUpdateIntoAndDeleteFrom(t *testing.T, db *gorm.DB) {
+	t.Helper()
+	_ = db.Migrator().DropTable(&testutil.UserMasterLogs{})
+	if err := db.AutoMigrate(&testutil.UserMaster{}, &testutil.UserMasterLogs{}); err != nil {
+		t.Fatalf("AutoMigrate: %v", err)
+	}
+	t.Cleanup(func() { _ = db.Migrator().DropTable(&testutil.UserMasterLogs{}) })
+
+	client := dbobjects.NewClient(db)
+	ctx := context.Background()
+	triggers := []dbobjects.DBObject{
+		trigger.AfterUpdate(&testutil.UserMaster{}).UpdateInto(&testutil.UserMasterLogs{},
+			map[string]trigger.Expr{
+				"old_name": trigger.Previous("name"),
+				"new_name": trigger.Column("name"),
+			},
+			map[string]trigger.Expr{
+				"user_master_id": trigger.Column("id"),
+				"new_name":       trigger.Previous("name"),
+			}),
+		trigger.AfterDelete(&testutil.UserMaster{}).DeleteFrom(&testutil.UserMasterLogs{},
+			map[string]trigger.Expr{"user_master_id": trigger.Column("id")}),
+	}
+	if err := client.Register(ctx, triggers...); err != nil {
+		t.Fatalf("Register: %v", err)
+	}
+	t.Cleanup(func() { _ = client.Drop(ctx, triggers...) })
+
+	stamp := time.Now().UnixNano()
+	names := []string{"Ann", "Bob", "Cat"}
+	users := make([]testutil.UserMaster, len(names))
+	for i, name := range names {
+		users[i] = testutil.UserMaster{Name: name, Email: fmt.Sprintf("%s-updinto-%d@example.com", name, stamp)}
+	}
+	if err := db.Create(&users).Error; err != nil {
+		t.Fatalf("Create users: %v", err)
+	}
+	t.Cleanup(func() { db.Unscoped().Delete(&users) })
+
+	logs := make([]testutil.UserMasterLogs, len(users))
+	for i, u := range users {
+		name := u.Name
+		logs[i] = testutil.UserMasterLogs{UserMasterID: u.ID, LogMessage: "seed", NewName: &name}
+	}
+	if err := db.Create(&logs).Error; err != nil {
+		t.Fatalf("Create logs: %v", err)
+	}
+
+	a, b, c := users[0].ID, users[1].ID, users[2].ID
+	if err := db.Exec("UPDATE user_master SET name = 'Same' WHERE id IN (?, ?)", a, b).Error; err != nil {
+		t.Fatalf("update: %v", err)
+	}
+
+	// check compares each user's log row, as "old>new", against want.
+	check := func(step string, want map[uint]string) {
+		t.Helper()
+		var got []testutil.UserMasterLogs
+		if err := db.Where("user_master_id IN ?", []uint{a, b, c}).Find(&got).Error; err != nil {
+			t.Fatalf("%s: Find: %v", step, err)
+		}
+		str := func(s *string) string {
+			if s == nil {
+				return "-"
+			}
+			return *s
+		}
+		have := map[uint]string{}
+		for _, r := range got {
+			have[r.UserMasterID] = str(r.OldName) + ">" + str(r.NewName)
+		}
+		if len(got) != len(want) || fmt.Sprint(have) != fmt.Sprint(want) {
+			t.Errorf("%s: log rows = %v, want %v", step, have, want)
+		}
+	}
+	check("after update", map[uint]string{a: "Ann>Same", b: "Bob>Same", c: "->Cat"})
+
+	// Raw DELETE: gorm would soft-delete, which is an UPDATE.
+	if err := db.Exec("DELETE FROM user_master WHERE id = ?", a).Error; err != nil {
+		t.Fatalf("delete: %v", err)
+	}
+	check("after delete", map[uint]string{b: "Bob>Same", c: "->Cat"})
+}
+
+func TestRegister_UpdateIntoAndDeleteFrom_Postgres(t *testing.T) {
+	db, err := testutil.NewPostgres()
+	if err != nil {
+		t.Skipf("skipping integration test, no Postgres reachable: %v", err)
+	}
+	runUpdateIntoAndDeleteFrom(t, db)
+}
+
+func TestRegister_UpdateIntoAndDeleteFrom_MySQL(t *testing.T) {
+	db, err := testutil.NewMySQL()
+	if err != nil {
+		t.Skipf("skipping integration test, no MySQL reachable: %v", err)
+	}
+	runUpdateIntoAndDeleteFrom(t, db)
+}
+
+func TestRegister_UpdateIntoAndDeleteFrom_SQLite(t *testing.T) {
+	db, err := testutil.NewSQLite(newSQLiteDSN(t))
+	if err != nil {
+		t.Skipf("skipping integration test, no SQLite available: %v", err)
+	}
+	runUpdateIntoAndDeleteFrom(t, db)
+}
+
+func TestRegister_UpdateIntoAndDeleteFrom_SQLServer(t *testing.T) {
+	db, err := testutil.NewSQLServer()
+	if err != nil {
+		t.Skipf("skipping integration test, no SQL Server reachable: %v", err)
+	}
+	runUpdateIntoAndDeleteFrom(t, db)
 }

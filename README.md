@@ -130,6 +130,35 @@ tr := trigger.AfterDelete(&User{}).
     Body("INSERT INTO user_audit(user_id, action) VALUES (OLD.id, 'deleted');")
 ```
 
+To write a row to another table, `InsertInto` does the same without raw `OLD`/`NEW` SQL, and checks the column names on both tables at build time. `trigger.Column` is a column of the row that fired the trigger (the new values on insert and update, the removed row on delete), and `trigger.Previous` is its value before an update. `Now()` and `Raw()` work too:
+
+```go
+tr := trigger.AfterUpdate(&User{}).
+    InsertInto(&UserAudit{}, map[string]trigger.Expr{
+        "user_id":  trigger.Column("id"),
+        "old_name": trigger.Previous("name"),
+        "new_name": trigger.Column("name"),
+        "action":   trigger.Raw("'renamed'"),
+    })
+```
+
+`UpdateInto` and `DeleteFrom` change rows that already exist in another table. They take a `match` map of conditions, all of which must be equal, and at least one has to use `Column` or `Previous` so a trigger can't hit unrelated rows:
+
+```go
+// keep a copied name in step: set, then match
+rename := trigger.AfterUpdate(&User{}).
+    UpdateInto(&Order{},
+        map[string]trigger.Expr{"customer_name": trigger.Column("name")},
+        map[string]trigger.Expr{"user_id": trigger.Column("id")})
+
+cleanup := trigger.AfterDelete(&User{}).
+    DeleteFrom(&Session{}, map[string]trigger.Expr{"user_id": trigger.Column("id")})
+```
+
+If a foreign key with `ON DELETE CASCADE` can do the delete, prefer that.
+
+An audit table like this usually shouldn't have a foreign key to the table it audits, or writing the row for a hard-deleted record fails and blocks the delete. gorm's default `Delete` on a soft-delete model is an `UPDATE`, so it fires update triggers, not delete triggers.
+
 Views work the same way, built from a gorm query callback instead of a
 raw SQL string — `dbobjects` reuses gorm's own dialect layer to resolve
 it, so the same view definition renders correctly on whichever engine
@@ -279,6 +308,24 @@ knowing before you hit them rather than after.
   render-time error — SQL Server has no `BEFORE` DML trigger to keep,
   and there's no library-supported workaround (a raw `INSTEAD OF`
   trigger issued outside this library is the only path).
+- A trigger can use only one of `InsertInto`, `UpdateInto`, and
+  `DeleteFrom`, and not together with `Set()` or `Body()`. `Previous` is
+  only valid on update triggers.
+- `UpdateInto`/`DeleteFrom` conditions are `column = value` joined by
+  `AND` — no other operators, and a `NULL` value never matches. Use
+  `Body()` for anything else.
+- On SQL Server, if one statement changes several rows that match the
+  same `UpdateInto` target row, only one is applied, so don't accumulate
+  values such as `Raw("total + 1")` there.
+- On SQL Server, a `BeforeDelete` action runs as `AFTER`, so a foreign key
+  without a cascade is expected to block the delete before it runs
+  (not tested).
+- `Column("id")` in a `BeforeInsert` trigger may not hold the
+  auto-generated value yet on MySQL and SQLite; use `AfterInsert`.
+- On SQL Server, these actions on a `BEFORE`-declared trigger run as
+  `AFTER`, and using `Column` and `Previous` together needs a single
+  primary key (a row whose key changes in that update is skipped). Their
+  SQL Server form hasn't been run against a live server yet.
 
 **Views**
 - `Query(fn)` accepts an arbitrary gorm callback, so there's no

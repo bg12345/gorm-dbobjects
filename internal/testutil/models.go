@@ -17,12 +17,17 @@ func (UserMaster) TableName() string {
 	return "user_master"
 }
 
-type UserMasterLogs struct{
-	gorm.Model `json:"-"`
-	UserMasterID uint `gorm:"not null" json:"user_master_id"`
-	UserMaster UserMaster `gorm:"foreignKey:UserMasterID" json:"user_master"`
-	IPAddress string `gorm:"type:varchar(100);not null" json:"ip_address"`
-	LogMessage string `gorm:"type:varchar(100);not null" json:"log_message"`
+// UserMasterLogs records changes to UserMaster rows. It deliberately has
+// no foreign key to user_master, so a row can still be written for a user
+// that has just been hard-deleted. IPAddress is nullable because a
+// trigger has no way to know it.
+type UserMasterLogs struct {
+	gorm.Model   `json:"-"`
+	UserMasterID uint    `gorm:"not null" json:"user_master_id"`
+	IPAddress    string  `gorm:"type:varchar(100)" json:"ip_address"`
+	LogMessage   string  `gorm:"type:varchar(100);not null" json:"log_message"`
+	OldName      *string `gorm:"type:varchar(100)" json:"old_name"`
+	NewName      *string `gorm:"type:varchar(100)" json:"new_name"`
 }
 
 func (UserMasterLogs) TableName() string {
@@ -38,4 +43,3 @@ type JSONData struct {
 func (JSONData) TableName() string {
 	return "json_data"
 }
-

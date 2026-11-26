@@ -1413,3 +1413,148 @@ func slicesEqual(a, b []string) bool {
 	}
 	return true
 }
+
+// InsertInto: row-level engines read the firing row through NEW/OLD, SQL
+// Server through INSERT ... SELECT over inserted/deleted.
+
+type insertSrc struct {
+	ID    uint
+	Email string
+}
+
+type insertDst struct {
+	ID       uint
+	UserID   uint
+	Action   string
+	OldEmail string
+}
+
+func insertDef(t *testing.T, tr trigger.Trigger) *trigger.Definition {
+	t.Helper()
+	def, err := tr.Build()
+	if err != nil {
+		t.Fatalf("Build() error = %v", err)
+	}
+	return def
+}
+
+func TestRenderTrigger_InsertInto(t *testing.T) {
+	cols := map[string]trigger.Expr{
+		"user_id":   trigger.Column("id"),
+		"action":    trigger.Raw("'x'"),
+		"old_email": trigger.Previous("email"),
+	}
+	update := insertDef(t, trigger.BeforeUpdate(&insertSrc{}).InsertInto(&insertDst{}, cols))
+	del := insertDef(t, trigger.AfterDelete(&insertSrc{}).
+		InsertInto(&insertDst{}, map[string]trigger.Expr{"user_id": trigger.Column("id")}))
+	prevOnly := insertDef(t, trigger.AfterUpdate(&insertSrc{}).
+		InsertInto(&insertDst{}, map[string]trigger.Expr{"old_email": trigger.Previous("email")}))
+
+	rowLevel := "INSERT INTO insert_dsts (action, old_email, user_id) VALUES ('x', OLD.email, NEW.id);"
+	rowDelete := "INSERT INTO insert_dsts (user_id) VALUES (OLD.id);"
+
+	tests := []struct {
+		name string
+		d    triggerDialect
+		def  *trigger.Definition
+		want []string
+	}{
+		{"postgres update", postgresDialect{}, update, []string{rowLevel, "BEFORE UPDATE", "RETURN NEW;"}},
+		{"postgres delete", postgresDialect{}, del, []string{rowDelete, "RETURN OLD;"}},
+		{"mysql update", mysqlDialect{}, update, []string{rowLevel, "BEFORE UPDATE"}},
+		{"mysql delete", mysqlDialect{}, del, []string{rowDelete}},
+		// InsertInto must keep the declared timing, unlike Set().
+		{"sqlite update", sqliteDialect{}, update, []string{rowLevel, "BEFORE UPDATE"}},
+		{"sqlite delete", sqliteDialect{}, del, []string{rowDelete}},
+		{"sqlserver update", sqlServerDialect{}, update, []string{
+			"INSERT INTO insert_dsts (action, old_email, user_id) SELECT 'x', prev.email, src.id FROM inserted AS src INNER JOIN deleted AS prev ON src.id = prev.id;",
+			"AFTER UPDATE",
+		}},
+		{"sqlserver delete", sqlServerDialect{}, del, []string{"INSERT INTO insert_dsts (user_id) SELECT src.id FROM deleted AS src;"}},
+		{"sqlserver previous only", sqlServerDialect{}, prevOnly, []string{"INSERT INTO insert_dsts (old_email) SELECT prev.email FROM deleted AS prev;"}},
+	}
+	for _, tt := range tests {
+		stmts, err := tt.d.renderTrigger(tt.def)
+		if err != nil {
+			t.Errorf("%s: renderTrigger() error = %v", tt.name, err)
+			continue
+		}
+		sql := strings.Join(stmts, "\n")
+		for _, want := range tt.want {
+			if !strings.Contains(sql, want) {
+				t.Errorf("%s: output missing %q:\n%s", tt.name, want, sql)
+			}
+		}
+	}
+}
+
+// UpdateInto/DeleteFrom: row-level engines filter on NEW/OLD, SQL Server
+// joins the target to inserted/deleted.
+func TestRenderTrigger_UpdateIntoAndDeleteFrom(t *testing.T) {
+	update := insertDef(t, trigger.BeforeUpdate(&insertSrc{}).UpdateInto(&insertDst{},
+		map[string]trigger.Expr{"old_email": trigger.Column("email"), "action": trigger.Raw("'x'")},
+		map[string]trigger.Expr{"user_id": trigger.Column("id"), "old_email": trigger.Previous("email")}))
+	prevOnly := insertDef(t, trigger.AfterUpdate(&insertSrc{}).UpdateInto(&insertDst{},
+		map[string]trigger.Expr{"action": trigger.Raw("'x'")},
+		map[string]trigger.Expr{"old_email": trigger.Previous("email")}))
+	del := insertDef(t, trigger.BeforeDelete(&insertSrc{}).DeleteFrom(&insertDst{},
+		map[string]trigger.Expr{"user_id": trigger.Column("id"), "action": trigger.Raw("'x'")}))
+
+	rowUpdate := "UPDATE insert_dsts SET action = 'x', old_email = NEW.email WHERE old_email = OLD.email AND user_id = NEW.id;"
+	rowDelete := "DELETE FROM insert_dsts WHERE action = 'x' AND user_id = OLD.id;"
+
+	tests := []struct {
+		name string
+		d    triggerDialect
+		def  *trigger.Definition
+		want []string
+	}{
+		{"postgres update", postgresDialect{}, update, []string{rowUpdate, "BEFORE UPDATE"}},
+		{"postgres delete", postgresDialect{}, del, []string{rowDelete, "RETURN OLD;"}},
+		{"mysql update", mysqlDialect{}, update, []string{rowUpdate}},
+		{"mysql delete", mysqlDialect{}, del, []string{rowDelete}},
+		{"sqlite update", sqliteDialect{}, update, []string{rowUpdate, "BEFORE UPDATE"}},
+		{"sqlite delete", sqliteDialect{}, del, []string{rowDelete, "BEFORE DELETE"}},
+		{"sqlserver update", sqlServerDialect{}, update, []string{
+			"UPDATE t SET action = 'x', old_email = src.email FROM insert_dsts AS t CROSS JOIN inserted AS src INNER JOIN deleted AS prev ON src.id = prev.id WHERE t.old_email = prev.email AND t.user_id = src.id;",
+			"AFTER UPDATE",
+		}},
+		{"sqlserver previous only", sqlServerDialect{}, prevOnly, []string{
+			"UPDATE t SET action = 'x' FROM insert_dsts AS t CROSS JOIN deleted AS prev WHERE t.old_email = prev.email;",
+		}},
+		{"sqlserver delete", sqlServerDialect{}, del, []string{
+			"DELETE t FROM insert_dsts AS t CROSS JOIN deleted AS src WHERE t.action = 'x' AND t.user_id = src.id;",
+			"AFTER DELETE",
+		}},
+	}
+	for _, tt := range tests {
+		stmts, err := tt.d.renderTrigger(tt.def)
+		if err != nil {
+			t.Errorf("%s: renderTrigger() error = %v", tt.name, err)
+			continue
+		}
+		sql := strings.Join(stmts, "\n")
+		for _, want := range tt.want {
+			if !strings.Contains(sql, want) {
+				t.Errorf("%s: output missing %q:\n%s", tt.name, want, sql)
+			}
+		}
+	}
+}
+
+// Matching old rows to new ones takes a primary key on SQL Server.
+func TestSQLServerDialect_ActionColumnAndPrevious_NoPrimaryKey_Errors(t *testing.T) {
+	def := &trigger.Definition{
+		Table:  "accounts",
+		Timing: "AFTER",
+		Event:  "UPDATE",
+		Action: &trigger.Action{
+			Op:    trigger.OpDelete,
+			Table: "audits",
+			Match: map[string]trigger.Expr{"a": trigger.Column("a"), "b": trigger.Previous("b")},
+		},
+	}
+	if _, err := (sqlServerDialect{}).renderTrigger(def); err == nil {
+		t.Fatal("renderTrigger() error = nil, want error with no primary key")
+	}
+}
